@@ -13,12 +13,33 @@ import {
 
 // ─── Store hooks ──────────────────────────────────────────────────────────────
 
+let lastSnapshot: { sessions: TranscriptSession[]; activeId: string | null } | null = null;
+let lastSessionsJson = '';
+
 function useTranscriptStore() {
-  const getSnapshot = useCallback(() => ({
-    sessions: transcriptStore.getSessions(),
-    activeId: transcriptStore.getActiveSession()?.id || null,
-  }), []);
-  const subscribe = useCallback((cb: () => void) => transcriptStore.subscribe(cb), []);
+  const getSnapshot = useCallback(() => {
+    const sessions = transcriptStore.getSessions();
+    const activeSession = transcriptStore.getActiveSession();
+    const sessionsJson = JSON.stringify(sessions.map(s => s.id + s.updatedAt.getTime()));
+    
+    // Only create new snapshot if data actually changed
+    if (lastSnapshot && sessionsJson === lastSessionsJson) {
+      return lastSnapshot;
+    }
+    
+    lastSessionsJson = sessionsJson;
+    lastSnapshot = {
+      sessions,
+      activeId: activeSession?.id || null,
+    };
+    
+    return lastSnapshot;
+  }, []);
+  
+  const subscribe = useCallback((cb: () => void) => {
+    return transcriptStore.subscribe(cb);
+  }, []);
+  
   return useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
 }
 
@@ -350,7 +371,7 @@ export default function App() {
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col">
       {/* Notification */}
       {notification && (
-        <div className={`fixed top-4 right-4 z-50 px-4 py-3 rounded-lg shadow-lg max-w-md animate-in
+        <div className={`fixed top-4 right-4 z-50 px-4 py-3 rounded-lg shadow-lg max-w-md
           ${notification.type === 'error' ? 'bg-red-900/90 border border-red-700 text-red-100' : ''}
           ${notification.type === 'success' ? 'bg-emerald-900/90 border border-emerald-700 text-emerald-100' : ''}
           ${notification.type === 'info' ? 'bg-slate-800/90 border border-slate-600 text-slate-100' : ''}
