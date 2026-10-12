@@ -17,14 +17,26 @@ export type ProcessingMode = 'speech' | 'song' | 'sound_classification';
 
 export type AudioSourceType = 'file' | 'microphone' | 'display_capture';
 
+export type LiveSessionState =
+  | 'idle'
+  | 'requesting_permission'
+  | 'ready'
+  | 'capturing'
+  | 'paused'
+  | 'processing_stopped'
+  | 'ended'
+  | 'error';
+
 export interface TranscriptSegment {
   id: string;
   text: string;
-  startTime: number; // seconds
-  endTime: number; // seconds
+  startTime: number; // seconds from session/file start
+  endTime: number; // seconds from session/file start
   confidence?: number;
   language?: string;
   isUncertain?: boolean;
+  isPartial?: boolean; // true for live partial hypotheses
+  sourceIndex?: number; // for multi-file queue
 }
 
 export interface TranslationSegment {
@@ -42,29 +54,43 @@ export interface SoundEvent {
   endTime?: number;
 }
 
-export interface Transcript {
+export interface TranscriptSession {
   id: string;
-  sourceId: string;
+  sourceLabel: string;
+  sourceType: AudioSourceType | 'queue';
+  mode: ProcessingMode;
   segments: TranscriptSegment[];
+  partialSegment?: TranscriptSegment | null;
   language: string;
   detectedLanguage?: string;
-  mode: ProcessingMode;
+  translatedSegments: TranslationSegment[];
+  soundEvents: SoundEvent[];
+  status: JobStatus | LiveSessionState;
+  modelId?: string;
   createdAt: Date;
+  updatedAt: Date;
+  // For file queue
+  fileName?: string;
+  fileSize?: number;
+  duration?: number;
+  // Live session metadata
+  isLive?: boolean;
+  liveState?: LiveSessionState;
+  processingBacklog?: number;
+  droppedChunks?: number;
 }
 
-export interface Translation {
+export interface FileQueueItem {
   id: string;
-  transcriptId: string;
-  segments: TranslationSegment[];
-  targetLanguage: string;
-  createdAt: Date;
-}
-
-export interface SoundClassificationResult {
-  id: string;
-  sourceId: string;
-  events: SoundEvent[];
-  createdAt: Date;
+  file: File;
+  name: string;
+  size: number;
+  status: JobStatus;
+  progress: number;
+  progressMessage: string;
+  transcriptSessionId?: string;
+  error?: string;
+  addedAt: Date;
 }
 
 export interface AudioSource {
@@ -75,35 +101,8 @@ export interface AudioSource {
   sampleRate: number;
   channels: number;
   file?: File;
-  audioBuffer?: AudioBuffer;
   objectUrl?: string;
   createdAt: Date;
-}
-
-export interface JobState {
-  id: string;
-  sourceId: string;
-  status: JobStatus;
-  mode: ProcessingMode;
-  progress: number; // 0-100
-  progressMessage: string;
-  error?: string;
-  transcript?: Transcript;
-  translation?: Translation;
-  soundEvents?: SoundClassificationResult;
-  startedAt: Date;
-  cancelled: boolean;
-}
-
-export interface ModelInfo {
-  id: string;
-  name: string;
-  task: string;
-  size: string;
-  languages?: string[];
-  loaded: boolean;
-  loading: boolean;
-  error?: string;
 }
 
 export interface AppSettings {
@@ -114,148 +113,39 @@ export interface AppSettings {
   enableTranslation: boolean;
   enableWebGPU: boolean;
   enableTimestamps: boolean;
-  chunkDuration: number; // seconds
+  chunkDuration: number;
   maxConcurrentJobs: number;
   processingProvider: 'local' | 'api';
   apiProvider?: string;
   apiKey?: string;
+  // Live transcription settings
+  liveChunkDuration: number; // seconds of audio per live chunk
+  liveOverlapDuration: number; // seconds of overlap for deduplication
+  maxBufferedChunks: number; // max chunks in processing queue
 }
 
-export interface WorkerMessage {
-  type: 'transcribe' | 'classify' | 'translate' | 'cancel' | 'init';
-  payload: unknown;
-}
-
-export interface WorkerResponse {
-  type: 'progress' | 'result' | 'error' | 'status';
-  payload: unknown;
-}
-
-// Supported languages for Whisper
 export const SUPPORTED_LANGUAGES: Record<string, string> = {
-  'en': 'English',
-  'zh': 'Chinese (Mandarin)',
-  'de': 'German',
-  'es': 'Spanish',
-  'ru': 'Russian',
-  'ko': 'Korean',
-  'fr': 'French',
-  'ja': 'Japanese',
-  'pt': 'Portuguese',
-  'tr': 'Turkish',
-  'pl': 'Polish',
-  'ca': 'Catalan',
-  'nl': 'Dutch',
-  'ar': 'Arabic',
-  'sv': 'Swedish',
-  'it': 'Italian',
-  'id': 'Indonesian',
-  'hi': 'Hindi',
-  'fi': 'Finnish',
-  'vi': 'Vietnamese',
-  'he': 'Hebrew',
-  'uk': 'Ukrainian',
-  'el': 'Greek',
-  'ms': 'Malay',
-  'cs': 'Czech',
-  'ro': 'Romanian',
-  'da': 'Danish',
-  'hu': 'Hungarian',
-  'ta': 'Tamil',
-  'no': 'Norwegian',
-  'th': 'Thai',
-  'ur': 'Urdu',
-  'hr': 'Croatian',
-  'bg': 'Bulgarian',
-  'lt': 'Lithuanian',
-  'la': 'Latin',
-  'mi': 'Maori',
-  'ml': 'Malayalam',
-  'cy': 'Welsh',
-  'sk': 'Slovak',
-  'te': 'Telugu',
-  'fa': 'Persian',
-  'lv': 'Latvian',
-  'bn': 'Bengali',
-  'sr': 'Serbian',
-  'az': 'Azerbaijani',
-  'sl': 'Slovenian',
-  'kn': 'Kannada',
-  'et': 'Estonian',
-  'mk': 'Macedonian',
-  'br': 'Breton',
-  'eu': 'Basque',
-  'is': 'Icelandic',
-  'hy': 'Armenian',
-  'ne': 'Nepali',
-  'mn': 'Mongolian',
-  'bs': 'Bosnian',
-  'kk': 'Kazakh',
-  'sq': 'Albanian',
-  'sw': 'Swahili',
-  'gl': 'Galician',
-  'mr': 'Marathi',
-  'pa': 'Punjabi',
-  'si': 'Sinhala',
-  'km': 'Khmer',
-  'sn': 'Shona',
-  'yo': 'Yoruba',
-  'so': 'Somali',
-  'af': 'Afrikaans',
-  'oc': 'Occitan',
-  'ka': 'Georgian',
-  'be': 'Belarusian',
-  'tg': 'Tajik',
-  'sd': 'Sindhi',
-  'gu': 'Gujarati',
-  'am': 'Amharic',
-  'yi': 'Yiddish',
-  'lo': 'Lao',
-  'uz': 'Uzbek',
-  'fo': 'Faroese',
-  'ht': 'Haitian Creole',
-  'ps': 'Pashto',
-  'tk': 'Turkmen',
-  'nn': 'Nynorsk',
-  'mt': 'Maltese',
-  'sa': 'Sanskrit',
-  'lb': 'Luxembourgish',
-  'my': 'Myanmar',
-  'bo': 'Tibetan',
-  'tl': 'Tagalog',
-  'mg': 'Malagasy',
-  'as': 'Assamese',
-  'tt': 'Tatar',
-  'haw': 'Hawaiian',
-  'ln': 'Lingala',
-  'ha': 'Hausa',
-  'ba': 'Bashkir',
-  'jw': 'Javanese',
-  'su': 'Sundanese',
+  'en': 'English', 'zh': 'Chinese', 'de': 'German', 'es': 'Spanish',
+  'ru': 'Russian', 'ko': 'Korean', 'fr': 'French', 'ja': 'Japanese',
+  'pt': 'Portuguese', 'tr': 'Turkish', 'pl': 'Polish', 'nl': 'Dutch',
+  'ar': 'Arabic', 'sv': 'Swedish', 'it': 'Italian', 'id': 'Indonesian',
+  'hi': 'Hindi', 'fi': 'Finnish', 'vi': 'Vietnamese', 'uk': 'Ukrainian',
+  'el': 'Greek', 'cs': 'Czech', 'ro': 'Romanian', 'da': 'Danish',
+  'hu': 'Hungarian', 'ta': 'Tamil', 'no': 'Norwegian', 'th': 'Thai',
+  'hr': 'Croatian', 'bg': 'Bulgarian', 'fa': 'Persian', 'bn': 'Bengali',
+  'sr': 'Serbian', 'sk': 'Slovak', 'et': 'Estonian', 'ca': 'Catalan',
+  'lv': 'Latvian', 'lt': 'Lithuanian', 'sl': 'Slovenian', 'gl': 'Galician',
+  'he': 'Hebrew', 'ms': 'Malay', 'kn': 'Kannada', 'te': 'Telugu',
+  'ml': 'Malayalam', 'mr': 'Marathi', 'pa': 'Punjabi', 'ur': 'Urdu',
+  'sw': 'Swahili', 'af': 'Afrikaans',
 };
 
-// Whisper translation only supports translating TO English
 export const TRANSLATION_TARGET_LANGUAGES: Record<string, string> = {
-  'en': 'English',
-  'fr': 'French',
-  'de': 'German',
-  'es': 'Spanish',
-  'it': 'Italian',
-  'pt': 'Portuguese',
-  'nl': 'Dutch',
-  'ru': 'Russian',
-  'zh': 'Chinese',
-  'ja': 'Japanese',
-  'ko': 'Korean',
-  'ar': 'Arabic',
-  'hi': 'Hindi',
-  'tr': 'Turkish',
-  'pl': 'Polish',
-  'sv': 'Swedish',
-  'uk': 'Ukrainian',
-  'vi': 'Vietnamese',
-  'id': 'Indonesian',
-  'th': 'Thai',
+  'en': 'English', 'fr': 'French', 'de': 'German', 'es': 'Spanish',
+  'it': 'Italian', 'pt': 'Portuguese', 'nl': 'Dutch', 'ru': 'Russian',
+  'zh': 'Chinese', 'ja': 'Japanese', 'ko': 'Korean', 'ar': 'Arabic',
+  'hi': 'Hindi', 'tr': 'Turkish', 'pl': 'Polish', 'sv': 'Swedish',
+  'uk': 'Ukrainian', 'vi': 'Vietnamese', 'id': 'Indonesian', 'th': 'Thai',
 };
 
 export const WHISPER_MODELS = {
@@ -264,9 +154,4 @@ export const WHISPER_MODELS = {
   'Xenova/whisper-small': { name: 'Whisper Small', size: '~470 MB', multilingual: true },
 } as const;
 
-export const SOUND_CLASSIFICATION_MODELS = {
-  'Xenova/ast-finetuned-audioset-10-10-0.4593': { name: 'AST AudioSet', size: '~300 MB', labels: 527 },
-} as const;
-
 export type WhisperModelId = keyof typeof WHISPER_MODELS;
-export type SoundModelId = keyof typeof SOUND_CLASSIFICATION_MODELS;

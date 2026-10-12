@@ -1,15 +1,101 @@
-// Web Worker for running ML inference off the main thread
+// Web Worker for ML inference - supports both batch and chunk-based live transcription
 import { pipeline, env } from '@huggingface/transformers';
 
 // Configure transformers.js for browser environment
 env.allowLocalModels = false;
 env.useBrowserCache = true;
 
+// Model instances
 let transcriber: any = null;
 let classifier: any = null;
-let currentTask: { cancelled: boolean } | null = null;
+let modelLoading: Promise<void> | null = null;
+let currentModelId: string | null = null;
 
-interface TranscribePayload {
+function post(type: string, payload: unknown) {
+  self.postMessage({ type, payload });
+}
+
+async function ensureModel(modelId: string, useWebGPU: boolean = false): Promise<void> {
+  if (transcriber && currentModelId === modelId) return;
+  if (modelLoading) return modelLoading;
+  
+  modelLoading = (async () => {
+    post('model_progress', { progress: 0, message: 'Loading speech recognition model...' });
+    
+    const device = useWebGPU ? 'webgpu' : 'wasm';
+    const dtype = useWebGPU ? 'q4' : 'q8';
+    
+    try {
+      transcriber = await pipeline('automatic-speech-recognition', modelId, {
+        device,
+        dtype,
+        progress_callback: (progress: { status: string; progress?: number; file?: string }) => {
+          if (progress.status === 'download' && progress.progress !== undefined) {
+            post('model_progress', {
+              progress: Math.min(progress.progress, 95),
+              message: `Downloading model... ${Math.round(progress.progress)}%`
+            });
+          } else if (progress.status === 'init') {
+            post('model_progress', { progress: 90, message: 'Initializing model...' });
+          } else if (progress.status === 'progress' && progress.progress !== undefined) {
+            post('model_progress', {
+              progress: Math.min(progress.progress, 95),
+              message: `Loading... ${Math.round(progress.progress)}%`
+            });
+          } else if (progress.status === 'ready') {
+            post('model_progress', { progress: 100, message: 'Model ready' });
+          }
+        }
+      });
+      
+      currentModelId = modelId;
+      post('model_ready', { modelId });
+    } catch (err) {
+      const error = err instanceof Error ? err.message : String(err);
+      post('error', { error: `Failed to load model: ${error}` });
+      throw err;
+    } finally {
+      modelLoading = null;
+    }
+  })();
+  
+  return modelLoading;
+}
+
+async function ensureClassifier(modelId: string, useWebGPU: boolean = false): Promise<void> {
+  if (classifier) return;
+  
+  post('model_progress', { progress: 0, message: 'Loading sound classification model...' });
+  
+  const device = useWebGPU ? 'webgpu' : 'wasm';
+  const dtype = useWebGPU ? 'q4' : 'q8';
+  
+  try {
+    classifier = await pipeline('audio-classification', modelId, {
+      device,
+      dtype,
+      progress_callback: (progress: { status: string; progress?: number }) => {
+        if (progress.status === 'download' && progress.progress !== undefined) {
+          post('model_progress', {
+            progress: Math.min(progress.progress, 95),
+            message: `Downloading model... ${Math.round(progress.progress)}%`
+          });
+        } else if (progress.status === 'ready') {
+          post('model_progress', { progress: 100, message: 'Classification model ready' });
+        }
+      }
+    });
+    
+    post('model_ready', { modelId });
+  } catch (err) {
+    const error = err instanceof Error ? err.message : String(err);
+    post('error', { error: `Failed to load classification model: ${error}` });
+    throw err;
+  }
+}
+
+// Handle batch transcription (for file processing)
+async function handleTranscribe(payload: {
   audio: Float32Array;
   samplingRate: number;
   model: string;
@@ -17,122 +103,12 @@ interface TranscribePayload {
   task?: 'transcribe' | 'translate';
   chunkLength?: number;
   returnTimestamps?: boolean;
-}
-
-interface ClassifyPayload {
-  audio: Float32Array;
-  samplingRate: number;
-  model: string;
-  topK?: number;
-}
-
-interface TranslatePayload {
-  text: string;
-  sourceLanguage: string;
-  targetLanguage: string;
-  model: string;
-}
-
-function postProgress(progress: number, message: string) {
-  self.postMessage({
-    type: 'progress',
-    payload: { progress, message }
-  });
-}
-
-function postResult(result: unknown) {
-  self.postMessage({
-    type: 'result',
-    payload: result
-  });
-}
-
-function postError(error: string) {
-  self.postMessage({
-    type: 'error',
-    payload: { error }
-  });
-}
-
-async function loadTranscriptionModel(modelId: string, useWebGPU: boolean = false) {
-  if (transcriber) return;
-  
-  postProgress(0, 'Loading speech recognition model...');
-  
-  const device = useWebGPU ? 'webgpu' : 'wasm';
-  const dtype = useWebGPU ? 'fp16' : 'q8';
-  
+  useWebGPU?: boolean;
+}) {
   try {
-    transcriber = await pipeline('automatic-speech-recognition', modelId, {
-      device,
-      dtype,
-      progress_callback: (progress: { status: string; progress?: number; file?: string }) => {
-        if (progress.status === 'download' && progress.progress) {
-          postProgress(
-            Math.min(progress.progress, 95),
-            `Downloading model files... ${Math.round(progress.progress)}%`
-          );
-        } else if (progress.status === 'init') {
-          postProgress(90, 'Initializing model...');
-        } else if (progress.status === 'ready') {
-          postProgress(100, 'Model ready');
-        }
-      }
-    }) as any;
+    await ensureModel(payload.model, payload.useWebGPU);
     
-    postProgress(100, 'Speech recognition model loaded');
-  } catch (err) {
-    const error = err instanceof Error ? err.message : String(err);
-    postError(`Failed to load transcription model: ${error}`);
-    throw err;
-  }
-}
-
-async function loadClassificationModel(modelId: string, useWebGPU: boolean = false) {
-  if (classifier) return;
-  
-  postProgress(0, 'Loading sound classification model...');
-  
-  const device = useWebGPU ? 'webgpu' : 'wasm';
-  const dtype = useWebGPU ? 'fp16' : 'q8';
-  
-  try {
-    classifier = await pipeline('audio-classification', modelId, {
-      device,
-      dtype,
-      progress_callback: (progress: { status: string; progress?: number }) => {
-        if (progress.status === 'download' && progress.progress) {
-          postProgress(
-            Math.min(progress.progress, 95),
-            `Downloading classification model... ${Math.round(progress.progress)}%`
-          );
-        } else if (progress.status === 'ready') {
-          postProgress(100, 'Classification model ready');
-        }
-      }
-    }) as any;
-    
-    postProgress(100, 'Sound classification model loaded');
-  } catch (err) {
-    const error = err instanceof Error ? err.message : String(err);
-    postError(`Failed to load classification model: ${error}`);
-    throw err;
-  }
-}
-
-async function handleTranscribe(payload: TranscribePayload) {
-  const task = { cancelled: false };
-  currentTask = task;
-  
-  try {
-    await loadTranscriptionModel(payload.model);
-    
-    if (task.cancelled) {
-      postResult({ type: 'cancelled' });
-      return;
-    }
-    
-    postProgress(50, 'Transcribing audio...');
+    post('progress', { progress: 30, message: 'Transcribing audio...' });
     
     const options: Record<string, unknown> = {
       return_timestamps: payload.returnTimestamps ?? true,
@@ -140,7 +116,7 @@ async function handleTranscribe(payload: TranscribePayload) {
       stride_length_s: 5,
     };
     
-    if (payload.language && payload.language !== 'auto') {
+    if (payload.language) {
       options.language = payload.language;
     }
     
@@ -148,12 +124,7 @@ async function handleTranscribe(payload: TranscribePayload) {
       options.task = 'translate';
     }
     
-    const result = await (transcriber as any)(payload.audio, options);
-    
-    if (task.cancelled) {
-      postResult({ type: 'cancelled' });
-      return;
-    }
+    const result = await transcriber(payload.audio, options);
     
     // Process result into segments
     const segments = [];
@@ -165,7 +136,7 @@ async function handleTranscribe(payload: TranscribePayload) {
           text: chunk.text?.trim() || '',
           startTime: chunk.timestamp?.[0] ?? 0,
           endTime: chunk.timestamp?.[1] ?? 0,
-          language: payload.language !== 'auto' ? payload.language : result.language,
+          language: payload.language || result.language,
         });
       }
     } else {
@@ -178,134 +149,147 @@ async function handleTranscribe(payload: TranscribePayload) {
       });
     }
     
-    postResult({
+    post('result', {
       type: 'transcription',
       segments,
       language: result.language || payload.language || 'unknown',
     });
     
   } catch (err) {
-    if (task.cancelled) {
-      postResult({ type: 'cancelled' });
-      return;
-    }
     const error = err instanceof Error ? err.message : String(err);
-    postError(`Transcription failed: ${error}`);
+    post('error', { error: `Transcription failed: ${error}` });
   }
 }
 
-async function handleClassify(payload: ClassifyPayload) {
-  const task = { cancelled: false };
-  currentTask = task;
-  
+// Handle single chunk transcription (for live streaming)
+async function handleTranscribeChunk(payload: {
+  audio: Float32Array;
+  samplingRate: number;
+  chunkIndex: number;
+  chunkStartTime: number;
+  language?: string;
+  mode: string;
+  modelId?: string;
+  useWebGPU?: boolean;
+  version?: number;
+}) {
   try {
-    await loadClassificationModel(payload.model);
+    // Ensure model is loaded
+    const modelId = payload.modelId || 'Xenova/whisper-tiny';
+    await ensureModel(modelId, payload.useWebGPU);
     
-    if (task.cancelled) {
-      postResult({ type: 'cancelled' });
-      return;
+    // Transcribe the chunk
+    const options: Record<string, unknown> = {
+      return_timestamps: true,
+      chunk_length_s: 30,
+      stride_length_s: 5,
+    };
+    
+    if (payload.language) {
+      options.language = payload.language;
     }
     
-    postProgress(50, 'Classifying audio...');
+    const result = await transcriber(payload.audio, options);
     
-    const result = await (classifier as any)(payload.audio, {
+    // Extract segments with adjusted timestamps
+    const segments = [];
+    if (result.chunks && Array.isArray(result.chunks)) {
+      for (const chunk of result.chunks) {
+        const text = chunk.text?.trim();
+        if (!text) continue;
+        
+        segments.push({
+          text,
+          startTime: (chunk.timestamp?.[0] ?? 0) + payload.chunkStartTime,
+          endTime: (chunk.timestamp?.[1] ?? 0) + payload.chunkStartTime,
+        });
+      }
+    } else if (result.text?.trim()) {
+      segments.push({
+        text: result.text.trim(),
+        startTime: payload.chunkStartTime,
+        endTime: payload.chunkStartTime + (payload.audio.length / payload.samplingRate),
+      });
+    }
+    
+    post('chunk_result', {
+      chunkIndex: payload.chunkIndex,
+      segments,
+      language: result.language || payload.language,
+      version: payload.version ?? 0,
+    });
+    
+  } catch (err) {
+    const error = err instanceof Error ? err.message : String(err);
+    post('error', { error: `Chunk transcription failed: ${error}` });
+  }
+}
+
+// Handle sound classification
+async function handleClassify(payload: {
+  audio: Float32Array;
+  samplingRate: number;
+  model: string;
+  topK?: number;
+  useWebGPU?: boolean;
+}) {
+  try {
+    await ensureClassifier(payload.model, payload.useWebGPU);
+    
+    post('progress', { progress: 50, message: 'Classifying audio...' });
+    
+    const result = await classifier(payload.audio, {
       topk: payload.topK ?? 5,
     });
     
-    if (task.cancelled) {
-      postResult({ type: 'cancelled' });
-      return;
-    }
-    
-    const events = Array.isArray(result) ? result.map((r: { label: string; score: number }, i: number) => ({
+    const events = Array.isArray(result) ? result.map((r: { label: string; score: number }) => ({
       label: r.label,
       score: r.score,
       startTime: 0,
       endTime: 0,
     })) : [];
     
-    postResult({
+    post('result', {
       type: 'classification',
       events,
     });
     
   } catch (err) {
-    if (task.cancelled) {
-      postResult({ type: 'cancelled' });
-      return;
-    }
     const error = err instanceof Error ? err.message : String(err);
-    postError(`Classification failed: ${error}`);
+    post('error', { error: `Classification failed: ${error}` });
   }
 }
 
-async function handleTranslate(payload: TranslatePayload) {
-  const task = { cancelled: false };
-  currentTask = task;
-  
-  try {
-    // Use Whisper's built-in translation (only supports -> English)
-    if (payload.targetLanguage === 'en') {
-      await loadTranscriptionModel(payload.model);
-      
-      if (task.cancelled) {
-        postResult({ type: 'cancelled' });
-        return;
-      }
-      
-      postProgress(50, 'Translating to English...');
-      
-      // For text translation, we note that Whisper translates audio->English
-      // For text-to-text translation, we'd need a different model
-      // Here we acknowledge the limitation
-      postResult({
-        type: 'translation',
-        note: 'Whisper model translates speech directly to English. For text-to-text translation, a separate translation model is needed.',
-        segments: [],
-        targetLanguage: payload.targetLanguage,
-      });
-    } else {
-      postResult({
-        type: 'translation',
-        note: `Translation to ${payload.targetLanguage} requires a dedicated translation model. Whisper only supports direct translation to English from speech.`,
-        segments: [],
-        targetLanguage: payload.targetLanguage,
-      });
-    }
-    
-  } catch (err) {
-    if (task.cancelled) {
-      postResult({ type: 'cancelled' });
-      return;
-    }
-    const error = err instanceof Error ? err.message : String(err);
-    postError(`Translation failed: ${error}`);
-  }
-}
-
+// Message handler
 self.onmessage = async (event: MessageEvent) => {
   const { type, payload } = event.data;
   
   switch (type) {
-    case 'transcribe':
-      await handleTranscribe(payload as TranscribePayload);
-      break;
-    case 'classify':
-      await handleClassify(payload as ClassifyPayload);
-      break;
-    case 'translate':
-      await handleTranslate(payload as TranslatePayload);
-      break;
-    case 'cancel':
-      if (currentTask) {
-        currentTask.cancelled = true;
+    case 'init_model':
+      try {
+        await ensureModel(payload.modelId, payload.useWebGPU);
+      } catch (e) {
+        // Error already posted by ensureModel
       }
       break;
-    case 'init':
-      // Pre-initialization message
-      postProgress(0, 'Worker initialized');
+      
+    case 'transcribe':
+      await handleTranscribe(payload);
       break;
+      
+    case 'transcribe_chunk':
+      await handleTranscribeChunk(payload);
+      break;
+      
+    case 'classify':
+      await handleClassify(payload);
+      break;
+      
+    case 'cancel':
+      // Cancellation is handled by the session manager checking isCancelled
+      break;
+      
     default:
-      postError(`Unknown message type: ${type}`);
+      post('error', { error: `Unknown message type: ${type}` });
   }
 };

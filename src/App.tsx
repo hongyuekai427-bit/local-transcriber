@@ -1,33 +1,31 @@
-import { useState, useRef, useCallback, useEffect } from 'react';
+import { useState, useRef, useCallback, useEffect, useSyncExternalStore } from 'react';
 import type {
-  JobState, AudioSource, TranscriptSegment, SoundEvent,
-  AppSettings, ProcessingMode, JobStatus
+  AppSettings, ProcessingMode, TranscriptSession, FileQueueItem, LiveSessionState
 } from './types';
-import { SUPPORTED_LANGUAGES, TRANSLATION_TARGET_LANGUAGES, WHISPER_MODELS } from './types';
-import {
-  decodeAudioFile, prepareForWhisper, isSupportedAudioFile,
-  formatDuration, createPlaybackUrl, generateId
-} from './services/audioProcessor';
+import { SUPPORTED_LANGUAGES, WHISPER_MODELS } from './types';
+import { isSupportedAudioFile, formatDuration, generateId, createPlaybackUrl } from './services/audioProcessor';
+import { transcriptStore } from './services/transcriptStore';
+import { LiveTranscriptionSession } from './services/liveSession';
+import { FileQueueManager } from './services/fileQueue';
 import {
   exportAsText, exportAsSRT, exportAsVTT, exportAsJSON, downloadFile
 } from './services/exportService';
 
+// ─── Store hooks ──────────────────────────────────────────────────────────────
+
+function useTranscriptStore() {
+  const getSnapshot = useCallback(() => ({
+    sessions: transcriptStore.getSessions(),
+    activeId: transcriptStore.getActiveSession()?.id || null,
+  }), []);
+  const subscribe = useCallback((cb: () => void) => transcriptStore.subscribe(cb), []);
+  return useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+}
+
 // ─── Main App ─────────────────────────────────────────────────────────────────
 
 export default function App() {
-  // State
-  const [audioSource, setAudioSource] = useState<AudioSource | null>(null);
-  const [job, setJob] = useState<JobState | null>(null);
-  const [segments, setSegments] = useState<TranscriptSegment[]>([]);
-  const [soundEvents, setSoundEvents] = useState<SoundEvent[]>([]);
-  const [editingSegmentId, setEditingSegmentId] = useState<string | null>(null);
-  const [showSettings, setShowSettings] = useState(false);
-  const [isRecording, setIsRecording] = useState(false);
-  const [recordingDuration, setRecordingDuration] = useState(0);
-  const [isCapturing, setIsCapturing] = useState(false);
-  const [dragOver, setDragOver] = useState(false);
-  const [notification, setNotification] = useState<{ type: 'info' | 'error' | 'success'; message: string } | null>(null);
-
+  // Settings state
   const [settings, setSettings] = useState<AppSettings>({
     processingMode: 'speech',
     sourceLanguage: 'auto',
@@ -39,162 +37,160 @@ export default function App() {
     chunkDuration: 30,
     maxConcurrentJobs: 1,
     processingProvider: 'local',
+    liveChunkDuration: 6,
+    liveOverlapDuration: 2,
+    maxBufferedChunks: 5,
   });
 
-  const workerRef = useRef<Worker | null>(null);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
-  const recordingTimerRef = useRef<number | null>(null);
+  // UI state
+  const [showSettings, setShowSettings] = useState(false);
+  const [activeTab, setActiveTab] = useState<'live' | 'files' | 'results'>('live');
+  const [notification, setNotification] = useState<{ type: 'info' | 'error' | 'success'; message: string } | null>(null);
+  const [dragOver, setDragOver] = useState(false);
+  const [editingSegmentId, setEditingSegmentId] = useState<string | null>(null);
+  const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
+  const [showTranslation, setShowTranslation] = useState(false);
+
+  // Store subscription
+  const storeState = useTranscriptStore();
+  const sessions = storeState.sessions;
+  const activeSession = selectedSessionId
+    ? sessions.find(s => s.id === selectedSessionId) || sessions[0] || null
+    : sessions[0] || null;
+
+  // Refs and state
+  const liveSessionRef = useRef<LiveTranscriptionSession | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const audioRef = useRef<HTMLAudioElement>(null);
-  const playbackUrlRef = useRef<string | null>(null);
+  const [fileQueue, setFileQueue] = useState<FileQueueManager | null>(null);
 
-  // Initialize worker
+  // Initialize file queue
   useEffect(() => {
-    const worker = new Worker(
-      new URL('./workers/transcription.worker.ts', import.meta.url),
-      { type: 'module' }
-    );
-    
-    worker.onmessage = (event) => {
-      const { type, payload } = event.data;
-      
-      if (type === 'progress') {
-        setJob(prev => prev ? {
-          ...prev,
-          progress: payload.progress,
-          progressMessage: payload.message,
-          status: payload.progress >= 100 ? 'processing' : prev.status,
-        } : null);
-      } else if (type === 'result') {
-        handleWorkerResult(payload);
-      } else if (type === 'error') {
-        setJob(prev => prev ? {
-          ...prev,
-          status: 'failed',
-          error: payload.error,
-          progressMessage: payload.error,
-        } : null);
-        showNotification('error', payload.error);
-      }
-    };
-    
-    worker.onerror = (error) => {
-      showNotification('error', `Worker error: ${error.message}`);
-    };
-    
-    workerRef.current = worker;
-    
-    return () => {
-      worker.terminate();
-    };
+    const queue = new FileQueueManager({
+      modelId: settings.modelId,
+      language: settings.sourceLanguage,
+      mode: settings.processingMode,
+      enableWebGPU: settings.enableWebGPU,
+      chunkDuration: settings.chunkDuration,
+      enableTranslation: settings.enableTranslation,
+      targetLanguage: settings.targetLanguage,
+      maxConcurrent: settings.maxConcurrentJobs,
+    });
+    setFileQueue(queue);
+    return () => queue.destroy();
   }, []);
 
-  // Cleanup on unmount
+  // Update file queue config when settings change
   useEffect(() => {
-    return () => {
-      if (playbackUrlRef.current) {
-        URL.revokeObjectURL(playbackUrlRef.current);
-      }
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach(t => t.stop());
-      }
-      if (recordingTimerRef.current) {
-        clearInterval(recordingTimerRef.current);
-      }
-    };
-  }, []);
+    fileQueue?.updateConfig({
+      modelId: settings.modelId,
+      language: settings.sourceLanguage,
+      mode: settings.processingMode,
+      enableWebGPU: settings.enableWebGPU,
+      chunkDuration: settings.chunkDuration,
+      enableTranslation: settings.enableTranslation,
+      targetLanguage: settings.targetLanguage,
+    });
+  }, [fileQueue, settings.modelId, settings.sourceLanguage, settings.processingMode, settings.enableWebGPU, settings.chunkDuration, settings.enableTranslation, settings.targetLanguage]);
 
   // Notification auto-dismiss
   useEffect(() => {
     if (notification) {
-      const timer = setTimeout(() => setNotification(null), 5000);
+      const timer = setTimeout(() => setNotification(null), 6000);
       return () => clearTimeout(timer);
     }
   }, [notification]);
 
-  function showNotification(type: 'info' | 'error' | 'success', message: string) {
+  function notify(type: 'info' | 'error' | 'success', message: string) {
     setNotification({ type, message });
   }
 
-  function handleWorkerResult(payload: any) {
-    if (payload.type === 'transcription') {
-      const newSegments: TranscriptSegment[] = (payload.segments || []).map((s: any, i: number) => ({
-        id: s.id || `seg-${i}`,
-        text: s.text || '',
-        startTime: s.startTime || 0,
-        endTime: s.endTime || 0,
-        language: s.language || settings.sourceLanguage,
-        isUncertain: settings.processingMode === 'song',
-      }));
-      
-      setSegments(newSegments);
-      setJob(prev => prev ? { ...prev, status: 'completed', progress: 100, progressMessage: 'Transcription complete' } : null);
-      showNotification('success', `Transcription complete: ${newSegments.length} segments`);
-    } else if (payload.type === 'classification') {
-      setSoundEvents(payload.events || []);
-      setJob(prev => prev ? { ...prev, status: 'completed', progress: 100, progressMessage: 'Classification complete' } : null);
-      showNotification('success', 'Sound classification complete');
-    } else if (payload.type === 'cancelled') {
-      setJob(prev => prev ? { ...prev, status: 'cancelled', progressMessage: 'Cancelled' } : null);
+  // ─── Live Transcription ─────────────────────────────────────────────────────
+
+  const startLiveSession = useCallback(async (sourceType: 'microphone' | 'display_capture') => {
+    // Cancel existing live session
+    if (liveSessionRef.current) {
+      liveSessionRef.current.cancel();
+      liveSessionRef.current = null;
     }
-  }
+
+    const sessionId = generateId();
+    const label = sourceType === 'microphone' ? 'Microphone' : 'Tab Audio';
+    
+    transcriptStore.createLiveSession(label, sourceType, settings.processingMode);
+    
+    const session = new LiveTranscriptionSession({
+      sessionId,
+      modelId: settings.modelId,
+      language: settings.sourceLanguage,
+      mode: settings.processingMode,
+      enableWebGPU: settings.enableWebGPU,
+      chunkDuration: settings.liveChunkDuration,
+      overlapDuration: settings.liveOverlapDuration,
+      maxBufferedChunks: settings.maxBufferedChunks,
+      enableTranslation: settings.enableTranslation,
+      targetLanguage: settings.targetLanguage,
+    });
+    
+    liveSessionRef.current = session;
+    setActiveTab('results');
+    setSelectedSessionId(sessionId);
+    
+    try {
+      await session.start(sourceType);
+      notify('success', `${label} transcription started`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      notify('error', msg);
+      liveSessionRef.current = null;
+    }
+  }, [settings]);
+
+  const pauseLiveSession = useCallback(() => {
+    liveSessionRef.current?.pause();
+  }, []);
+
+  const resumeLiveSession = useCallback(() => {
+    liveSessionRef.current?.resume();
+  }, []);
+
+  const stopLiveSession = useCallback(() => {
+    liveSessionRef.current?.stop();
+    liveSessionRef.current = null;
+    notify('info', 'Live session stopped');
+  }, []);
+
+  const cancelLiveSession = useCallback(() => {
+    liveSessionRef.current?.cancel();
+    liveSessionRef.current = null;
+    notify('info', 'Live session cancelled');
+  }, []);
+
+  const isLiveActive = liveSessionRef.current !== null;
+  const liveState = activeSession?.liveState;
 
   // ─── File Handling ──────────────────────────────────────────────────────────
 
-  const handleFileSelect = useCallback(async (files: FileList | null) => {
+  const handleFileSelect = useCallback((files: FileList | null) => {
     if (!files || files.length === 0) return;
     
-    const file = files[0];
+    const fileArray = Array.from(files);
+    const validFiles = fileArray.filter(f => isSupportedAudioFile(f) && f.size > 0);
     
-    if (!isSupportedAudioFile(file)) {
-      showNotification('error', `Unsupported file type: ${file.type || 'unknown'}. Supported: WAV, MP3, OGG, FLAC, M4A, WebM, MP4`);
+    if (validFiles.length === 0) {
+      notify('error', 'No supported audio/video files found');
       return;
     }
     
-    if (file.size === 0) {
-      showNotification('error', 'File is empty');
-      return;
+    if (validFiles.length < fileArray.length) {
+      notify('info', `${fileArray.length - validFiles.length} unsupported file(s) skipped`);
     }
     
-    if (file.size > 500 * 1024 * 1024) {
-      showNotification('error', 'File too large (max 500MB for browser processing)');
-      return;
+    const ids = fileQueue?.addFiles(validFiles) || [];
+    if (ids.length > 0) {
+      setActiveTab('results');
+      notify('success', `Added ${ids.length} file(s) to queue`);
     }
-    
-    try {
-      // Cleanup previous
-      if (playbackUrlRef.current) {
-        URL.revokeObjectURL(playbackUrlRef.current);
-      }
-      
-      const objectUrl = createPlaybackUrl(file);
-      playbackUrlRef.current = objectUrl;
-      
-      const source: AudioSource = {
-        id: generateId(),
-        type: 'file',
-        name: file.name,
-        duration: 0,
-        sampleRate: 0,
-        channels: 0,
-        file,
-        objectUrl,
-        createdAt: new Date(),
-      };
-      
-      setAudioSource(source);
-      setSegments([]);
-      setSoundEvents([]);
-      setJob(null);
-      
-      showNotification('info', `Loaded: ${file.name}`);
-    } catch (err) {
-      showNotification('error', `Failed to load file: ${err instanceof Error ? err.message : 'Unknown error'}`);
-    }
-  }, []);
-
-  // ─── Drag and Drop ──────────────────────────────────────────────────────────
+  }, [fileQueue]);
 
   const handleDragOver = useCallback((e: React.DragEvent) => {
     e.preventDefault();
@@ -212,281 +208,24 @@ export default function App() {
     handleFileSelect(e.dataTransfer.files);
   }, [handleFileSelect]);
 
-  // ─── Microphone Recording ──────────────────────────────────────────────────
-
-  const startRecording = useCallback(async () => {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      streamRef.current = stream;
-      
-      const mediaRecorder = new MediaRecorder(stream, {
-        mimeType: MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
-          ? 'audio/webm;codecs=opus'
-          : 'audio/webm'
-      });
-      
-      const chunks: Blob[] = [];
-      mediaRecorder.ondataavailable = (e) => {
-        if (e.data.size > 0) chunks.push(e.data);
-      };
-      
-      mediaRecorder.onstop = async () => {
-        const blob = new Blob(chunks, { type: 'audio/webm' });
-        const file = new File([blob], `recording-${Date.now()}.webm`, { type: 'audio/webm' });
-        
-        if (playbackUrlRef.current) URL.revokeObjectURL(playbackUrlRef.current);
-        const objectUrl = URL.createObjectURL(blob);
-        playbackUrlRef.current = objectUrl;
-        
-        const source: AudioSource = {
-          id: generateId(),
-          type: 'microphone',
-          name: `Recording ${new Date().toLocaleTimeString()}`,
-          duration: recordingDuration,
-          sampleRate: 0,
-          channels: 1,
-          file,
-          objectUrl,
-          createdAt: new Date(),
-        };
-        
-        setAudioSource(source);
-        setSegments([]);
-        setSoundEvents([]);
-        setJob(null);
-        setIsRecording(false);
-        setRecordingDuration(0);
-        
-        stream.getTracks().forEach(t => t.stop());
-        streamRef.current = null;
-        
-        showNotification('success', 'Recording saved');
-      };
-      
-      mediaRecorderRef.current = mediaRecorder;
-      mediaRecorder.start(1000);
-      setIsRecording(true);
-      setRecordingDuration(0);
-      
-      recordingTimerRef.current = window.setInterval(() => {
-        setRecordingDuration(prev => prev + 1);
-      }, 1000);
-      
-    } catch (err) {
-      const message = err instanceof Error ? err.message : 'Unknown error';
-      if (message.includes('Permission') || message.includes('NotAllowed')) {
-        showNotification('error', 'Microphone permission denied. Please allow microphone access in your browser settings.');
-      } else {
-        showNotification('error', `Failed to start recording: ${message}`);
-      }
-    }
-  }, [recordingDuration]);
-
-  const stopRecording = useCallback(() => {
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-      mediaRecorderRef.current.stop();
-    }
-    if (recordingTimerRef.current) {
-      clearInterval(recordingTimerRef.current);
-      recordingTimerRef.current = null;
-    }
-  }, []);
-
-  // ─── Display Capture ────────────────────────────────────────────────────────
-
-  const startCapture = useCallback(async () => {
-    try {
-      const stream = await navigator.mediaDevices.getDisplayMedia({
-        video: true,
-        audio: true,
-      } as any);
-      
-      // Check if audio track is available
-      const audioTracks = stream.getAudioTracks();
-      if (audioTracks.length === 0) {
-        stream.getTracks().forEach(t => t.stop());
-        showNotification('error', 'No audio captured. Make sure to select "Share audio" or "Share tab audio" when prompted.');
-        return;
-      }
-      
-      streamRef.current = stream;
-      setIsCapturing(true);
-      
-      // Record the captured audio
-      const mediaRecorder = new MediaRecorder(stream, {
-        mimeType: MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
-          ? 'audio/webm;codecs=opus'
-          : 'audio/webm'
-      });
-      
-      const chunks: Blob[] = [];
-      mediaRecorder.ondataavailable = (e) => {
-        if (e.data.size > 0) chunks.push(e.data);
-      };
-      
-      // Handle track ending (user stops sharing)
-      audioTracks[0].onended = () => {
-        if (mediaRecorder.state !== 'inactive') {
-          mediaRecorder.stop();
-        }
-      };
-      
-      mediaRecorder.onstop = async () => {
-        const blob = new Blob(chunks, { type: 'audio/webm' });
-        const file = new File([blob], `capture-${Date.now()}.webm`, { type: 'audio/webm' });
-        
-        if (playbackUrlRef.current) URL.revokeObjectURL(playbackUrlRef.current);
-        const objectUrl = URL.createObjectURL(blob);
-        playbackUrlRef.current = objectUrl;
-        
-        const source: AudioSource = {
-          id: generateId(),
-          type: 'display_capture',
-          name: `Tab capture ${new Date().toLocaleTimeString()}`,
-          duration: 0,
-          sampleRate: 0,
-          channels: 1,
-          file,
-          objectUrl,
-          createdAt: new Date(),
-        };
-        
-        setAudioSource(source);
-        setIsCapturing(false);
-        stream.getTracks().forEach(t => t.stop());
-        streamRef.current = null;
-        
-        showNotification('success', 'Capture saved');
-      };
-      
-      mediaRecorderRef.current = mediaRecorder;
-      mediaRecorder.start(1000);
-      
-    } catch (err) {
-      const message = err instanceof Error ? err.message : 'Unknown error';
-      if (message.includes('Permission') || message.includes('NotAllowed')) {
-        showNotification('error', 'Screen capture permission denied.');
-      } else {
-        showNotification('error', `Capture failed: ${message}`);
-      }
-      setIsCapturing(false);
-    }
-  }, []);
-
-  const stopCapture = useCallback(() => {
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-      mediaRecorderRef.current.stop();
-    }
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach(t => t.stop());
-      streamRef.current = null;
-    }
-    setIsCapturing(false);
-  }, []);
-
-  // ─── Processing ─────────────────────────────────────────────────────────────
-
-  const startProcessing = useCallback(async () => {
-    if (!audioSource?.file) {
-      showNotification('error', 'No audio source loaded');
-      return;
-    }
-    
-    if (!workerRef.current) {
-      showNotification('error', 'Worker not initialized');
-      return;
-    }
-    
-    const jobId = generateId();
-    setJob({
-      id: jobId,
-      sourceId: audioSource.id,
-      status: 'decoding',
-      mode: settings.processingMode,
-      progress: 0,
-      progressMessage: 'Decoding audio...',
-      startedAt: new Date(),
-      cancelled: false,
-    });
-    
-    setSegments([]);
-    setSoundEvents([]);
-    
-    try {
-      // Decode audio
-      const decoded = await decodeAudioFile(audioSource.file);
-      
-      if (settings.processingMode === 'sound_classification') {
-        // Sound classification
-        const audioData = prepareForWhisper(decoded);
-        
-        setJob(prev => prev ? { ...prev, status: 'processing', progressMessage: 'Classifying sounds...' } : null);
-        
-        workerRef.current.postMessage({
-          type: 'classify',
-          payload: {
-            audio: audioData,
-            samplingRate: 16000,
-            model: 'Xenova/ast-finetuned-audioset-10-10-0.4593',
-            topK: 10,
-          }
-        });
-      } else {
-        // Speech/Song transcription
-        const audioData = prepareForWhisper(decoded);
-        
-        setJob(prev => prev ? { ...prev, status: 'waiting_for_model', progressMessage: 'Loading model...' } : null);
-        
-        const task = settings.enableTranslation && settings.targetLanguage === 'en'
-          ? 'translate'
-          : 'transcribe';
-        
-        workerRef.current.postMessage({
-          type: 'transcribe',
-          payload: {
-            audio: audioData,
-            samplingRate: 16000,
-            model: settings.modelId,
-            language: settings.sourceLanguage === 'auto' ? undefined : settings.sourceLanguage,
-            task,
-            chunkLength: settings.chunkDuration,
-            returnTimestamps: settings.enableTimestamps,
-          }
-        });
-      }
-      
-    } catch (err) {
-      const message = err instanceof Error ? err.message : 'Unknown error';
-      setJob(prev => prev ? { ...prev, status: 'failed', error: message, progressMessage: message } : null);
-      showNotification('error', `Processing failed: ${message}`);
-    }
-  }, [audioSource, settings]);
-
-  const cancelProcessing = useCallback(() => {
-    if (workerRef.current) {
-      workerRef.current.postMessage({ type: 'cancel' });
-    }
-    setJob(prev => prev ? { ...prev, cancelled: true, status: 'cancelled', progressMessage: 'Cancelling...' } : null);
-  }, []);
-
-  // ─── Transcript Editing ─────────────────────────────────────────────────────
-
-  const updateSegmentText = useCallback((id: string, text: string) => {
-    setSegments(prev => prev.map(s => s.id === id ? { ...s, text } : s));
-  }, []);
-
   // ─── Export ─────────────────────────────────────────────────────────────────
 
   const handleExport = useCallback((format: 'txt' | 'srt' | 'vtt' | 'json') => {
-    if (segments.length === 0 && soundEvents.length === 0) {
-      showNotification('error', 'No transcript data to export');
+    if (!activeSession) {
+      notify('error', 'No transcript selected');
       return;
     }
     
-    const baseName = audioSource?.name?.replace(/\.[^.]+$/, '') || 'transcript';
+    if (activeSession.segments.length === 0 && activeSession.soundEvents.length === 0) {
+      notify('error', 'No data to export');
+      return;
+    }
+    
+    const baseName = activeSession.sourceLabel?.replace(/\.[^.]+$/, '') || 'transcript';
     const options = {
       includeTimestamps: settings.enableTimestamps,
-      includeTranslation: false,
+      includeTranslation: showTranslation && activeSession.translatedSegments.length > 0,
+      translatedSegments: activeSession.translatedSegments,
     };
     
     let content: string;
@@ -495,63 +234,115 @@ export default function App() {
     
     switch (format) {
       case 'txt':
-        content = exportAsText(segments, options);
+        content = exportAsText(activeSession.segments, options);
         mimeType = 'text/plain';
         ext = 'txt';
         break;
       case 'srt':
-        content = exportAsSRT(segments, options);
-        mimeType = 'text/srt';
+        content = exportAsSRT(activeSession.segments, options);
+        mimeType = 'text/plain';
         ext = 'srt';
         break;
       case 'vtt':
-        content = exportAsVTT(segments, options);
+        content = exportAsVTT(activeSession.segments, options);
         mimeType = 'text/vtt';
         ext = 'vtt';
         break;
       case 'json':
-        content = exportAsJSON(segments, options, {
-          language: segments[0]?.language,
-          sourceFile: audioSource?.name,
+        content = exportAsJSON(activeSession.segments, options, {
+          language: activeSession.language,
+          sourceFile: activeSession.fileName,
         });
         mimeType = 'application/json';
         ext = 'json';
         break;
+      default:
+        return;
     }
     
     downloadFile(content, `${baseName}.${ext}`, mimeType);
-    showNotification('success', `Exported as ${format.toUpperCase()}`);
-  }, [segments, soundEvents, audioSource, settings]);
+    notify('success', `Exported as ${format.toUpperCase()}`);
+  }, [activeSession, settings.enableTimestamps, showTranslation]);
 
-  // ─── Clear Session ──────────────────────────────────────────────────────────
+  // ─── Segment Editing ────────────────────────────────────────────────────────
 
-  const clearSession = useCallback(() => {
-    if (playbackUrlRef.current) {
-      URL.revokeObjectURL(playbackUrlRef.current);
-      playbackUrlRef.current = null;
+  const updateSegmentText = useCallback((sessionId: string, segmentId: string, text: string) => {
+    transcriptStore.updateSegment(sessionId, segmentId, text);
+  }, []);
+
+  // ─── Session Management ─────────────────────────────────────────────────────
+
+  const removeSession = useCallback((id: string) => {
+    transcriptStore.removeSession(id);
+    if (selectedSessionId === id) {
+      setSelectedSessionId(null);
     }
-    setAudioSource(null);
-    setJob(null);
-    setSegments([]);
-    setSoundEvents([]);
-    setEditingSegmentId(null);
-    showNotification('info', 'Session cleared');
+  }, [selectedSessionId]);
+
+  const clearAllSessions = useCallback(() => {
+    if (liveSessionRef.current) {
+      liveSessionRef.current.cancel();
+      liveSessionRef.current = null;
+    }
+    transcriptStore.clearAll();
+    setSelectedSessionId(null);
+    notify('info', 'All sessions cleared');
   }, []);
 
   // ─── Status Helpers ─────────────────────────────────────────────────────────
 
-  const getStatusColor = (status: JobStatus): string => {
-    switch (status) {
-      case 'completed': return 'text-emerald-400';
-      case 'failed': return 'text-red-400';
-      case 'cancelled': return 'text-amber-400';
-      case 'processing':
-      case 'translating': return 'text-blue-400';
-      default: return 'text-slate-400';
-    }
+  const getStatusBadge = (session: TranscriptSession) => {
+    const state = session.isLive ? session.liveState : session.status;
+    const colors: Record<string, string> = {
+      idle: 'bg-slate-700 text-slate-300',
+      capturing: 'bg-emerald-900/50 text-emerald-300 border border-emerald-700/50',
+      paused: 'bg-amber-900/50 text-amber-300 border border-amber-700/50',
+      processing: 'bg-blue-900/50 text-blue-300 border border-blue-700/50',
+      completed: 'bg-emerald-900/50 text-emerald-300 border border-emerald-700/50',
+      failed: 'bg-red-900/50 text-red-300 border border-red-700/50',
+      cancelled: 'bg-slate-700 text-slate-400',
+      ended: 'bg-slate-700 text-slate-400',
+      requesting_permission: 'bg-violet-900/50 text-violet-300',
+      ready: 'bg-blue-900/50 text-blue-300',
+      processing_stopped: 'bg-blue-900/50 text-blue-300',
+      error: 'bg-red-900/50 text-red-300',
+      downloading_model: 'bg-violet-900/50 text-violet-300',
+      waiting_for_model: 'bg-violet-900/50 text-violet-300',
+      decoding: 'bg-blue-900/50 text-blue-300',
+    };
+    
+    const labels: Record<string, string> = {
+      idle: 'Idle',
+      capturing: '● Live',
+      paused: '⏸ Paused',
+      processing: '⟳ Processing',
+      completed: '✓ Done',
+      failed: '✗ Failed',
+      cancelled: '⊘ Cancelled',
+      ended: '✓ Ended',
+      requesting_permission: '⋯ Permission',
+      ready: '● Ready',
+      processing_stopped: '⟳ Finalizing',
+      error: '✗ Error',
+      downloading_model: '↓ Downloading',
+      waiting_for_model: '⋯ Loading',
+      decoding: '⟳ Decoding',
+    };
+    
+    const color = colors[state || ''] || 'bg-slate-700 text-slate-300';
+    const label = labels[state || ''] || state || 'Unknown';
+    
+    return <span className={`text-xs font-medium px-2 py-0.5 rounded-full ${color}`}>{label}</span>;
   };
 
-  const isProcessing = job && !['completed', 'failed', 'cancelled', 'idle'].includes(job.status);
+  // ─── Cleanup on unmount ─────────────────────────────────────────────────────
+
+  useEffect(() => {
+    return () => {
+      liveSessionRef.current?.cancel();
+      fileQueue?.destroy();
+    };
+  }, []);
 
   // ─── Render ─────────────────────────────────────────────────────────────────
 
@@ -559,11 +350,11 @@ export default function App() {
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col">
       {/* Notification */}
       {notification && (
-        <div className={`fixed top-4 right-4 z-50 px-4 py-3 rounded-lg shadow-lg max-w-md transition-all
+        <div className={`fixed top-4 right-4 z-50 px-4 py-3 rounded-lg shadow-lg max-w-md animate-in
           ${notification.type === 'error' ? 'bg-red-900/90 border border-red-700 text-red-100' : ''}
           ${notification.type === 'success' ? 'bg-emerald-900/90 border border-emerald-700 text-emerald-100' : ''}
           ${notification.type === 'info' ? 'bg-slate-800/90 border border-slate-600 text-slate-100' : ''}
-        `} role="alert">
+        `} role="alert" aria-live="polite">
           <p className="text-sm">{notification.message}</p>
         </div>
       )}
@@ -572,509 +363,816 @@ export default function App() {
       <header className="border-b border-slate-800 bg-slate-900/80 backdrop-blur-sm sticky top-0 z-40">
         <div className="max-w-7xl mx-auto px-4 py-3 flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-blue-500 to-violet-600 flex items-center justify-center">
+            <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-blue-500 to-violet-600 flex items-center justify-center flex-shrink-0">
               <svg className="w-4 h-4 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                 <path strokeLinecap="round" strokeLinejoin="round" d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
               </svg>
             </div>
             <div>
               <h1 className="text-base font-semibold text-slate-100">AudioScribe</h1>
-              <p className="text-xs text-slate-500">Local-first multilingual transcription</p>
+              <p className="text-xs text-slate-500 hidden sm:block">Local-first multilingual transcription</p>
             </div>
           </div>
           
-          <div className="flex items-center gap-2">
-            {job && (
-              <span className={`text-xs font-medium px-2 py-1 rounded ${getStatusColor(job.status)} bg-slate-800/50`}>
-                {job.status.replace(/_/g, ' ')}
-              </span>
-            )}
-            <button
-              onClick={() => setShowSettings(!showSettings)}
-              className="p-2 rounded-lg hover:bg-slate-800 transition-colors text-slate-400 hover:text-slate-200"
-              aria-label="Settings"
-              title="Settings"
-            >
-              <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M9.594 3.94c.09-.542.56-.94 1.11-.94h2.593c.55 0 1.02.398 1.11.94l.213 1.281c.063.374.313.686.645.87.074.04.147.083.22.127.324.196.72.257 1.075.124l1.217-.456a1.125 1.125 0 011.37.49l1.296 2.247a1.125 1.125 0 01-.26 1.431l-1.003.827c-.293.24-.438.613-.431.992a6.759 6.759 0 010 .255c-.007.378.138.75.43.99l1.005.828c.424.35.534.954.26 1.43l-1.298 2.247a1.125 1.125 0 01-1.369.491l-1.217-.456c-.355-.133-.75-.072-1.076.124a6.57 6.57 0 01-.22.128c-.331.183-.581.495-.644.869l-.213 1.28c-.09.543-.56.941-1.11.941h-2.594c-.55 0-1.02-.398-1.11-.94l-.213-1.281c-.062-.374-.312-.686-.644-.87a6.52 6.52 0 01-.22-.127c-.325-.196-.72-.257-1.076-.124l-1.217.456a1.125 1.125 0 01-1.369-.49l-1.297-2.247a1.125 1.125 0 01.26-1.431l1.004-.827c.292-.24.437-.613.43-.992a6.932 6.932 0 010-.255c.007-.378-.138-.75-.43-.99l-1.004-.828a1.125 1.125 0 01-.26-1.43l1.297-2.247a1.125 1.125 0 011.37-.491l1.216.456c.356.133.751.072 1.076-.124.072-.044.146-.087.22-.128.332-.183.582-.495.644-.869l.214-1.281z" />
-                <path strokeLinecap="round" strokeLinejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
-              </svg>
-            </button>
-          </div>
+          {/* Tab navigation */}
+          <nav className="flex gap-1" role="tablist">
+            {(['live', 'files', 'results'] as const).map(tab => (
+              <button
+                key={tab}
+                role="tab"
+                aria-selected={activeTab === tab}
+                onClick={() => setActiveTab(tab)}
+                className={`px-3 py-1.5 text-sm font-medium rounded-lg transition-colors
+                  ${activeTab === tab
+                    ? 'bg-slate-800 text-slate-100'
+                    : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/50'
+                  }`}
+              >
+                {tab === 'live' ? '🎙 Live' : tab === 'files' ? '📁 Files' : '📝 Results'}
+                {tab === 'results' && sessions.length > 0 && (
+                  <span className="ml-1.5 text-xs text-slate-500">({sessions.length})</span>
+                )}
+              </button>
+            ))}
+          </nav>
+
+          <button
+            onClick={() => setShowSettings(true)}
+            className="p-2 rounded-lg hover:bg-slate-800 transition-colors text-slate-400 hover:text-slate-200"
+            aria-label="Settings"
+            title="Settings"
+          >
+            <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M9.594 3.94c.09-.542.56-.94 1.11-.94h2.593c.55 0 1.02.398 1.11.94l.213 1.281c.063.374.313.686.645.87.074.04.147.083.22.127.324.196.72.257 1.075.124l1.217-.456a1.125 1.125 0 011.37.49l1.296 2.247a1.125 1.125 0 01-.26 1.431l-1.003.827c-.293.24-.438.613-.431.992a6.759 6.759 0 010 .255c-.007.378.138.75.43.99l1.005.828c.424.35.534.954.26 1.43l-1.298 2.247a1.125 1.125 0 01-1.369.491l-1.217-.456c-.355-.133-.75-.072-1.076.124a6.57 6.57 0 01-.22.128c-.331.183-.581.495-.644.869l-.213 1.28c-.09.543-.56.941-1.11.941h-2.594c-.55 0-1.02-.398-1.11-.94l-.213-1.281c-.062-.374-.312-.686-.644-.87a6.52 6.52 0 01-.22-.127c-.325-.196-.72-.257-1.076-.124l-1.217.456a1.125 1.125 0 01-1.369-.49l-1.297-2.247a1.125 1.125 0 01.26-1.431l1.004-.827c.292-.24.437-.613.43-.992a6.932 6.932 0 010-.255c.007-.378-.138-.75-.43-.99l-1.004-.828a1.125 1.125 0 01-.26-1.43l1.297-2.247a1.125 1.125 0 011.37-.491l1.216.456c.356.133.751.072 1.076-.124.072-.044.146-.087.22-.128.332-.183.582-.495.644-.869l.214-1.281z" />
+              <path strokeLinecap="round" strokeLinejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+            </svg>
+          </button>
         </div>
       </header>
 
       {/* Main Content */}
       <main className="flex-1 max-w-7xl mx-auto w-full px-4 py-6">
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-          
-          {/* Left Panel - Audio Input & Controls */}
-          <div className="lg:col-span-5 space-y-4">
-            
-            {/* Processing Mode */}
+        
+        {/* ─── Live Tab ─────────────────────────────────────────────────────── */}
+        {activeTab === 'live' && (
+          <div className="space-y-6 max-w-2xl mx-auto">
+            <div className="text-center mb-8">
+              <h2 className="text-xl font-semibold text-slate-100 mb-2">Live Transcription</h2>
+              <p className="text-sm text-slate-400">
+                Real-time speech recognition from microphone or browser tab audio.
+                Transcript appears progressively as you speak.
+              </p>
+            </div>
+
+            {/* Mode selector */}
             <div className="bg-slate-900 border border-slate-800 rounded-xl p-4">
-              <h2 className="text-sm font-medium text-slate-300 mb-3">Processing Mode</h2>
+              <label className="block text-sm font-medium text-slate-300 mb-3">Recognition Mode</label>
               <div className="flex gap-2">
-                {(['speech', 'song', 'sound_classification'] as ProcessingMode[]).map(mode => (
+                {([
+                  { mode: 'speech' as ProcessingMode, label: '🎙 Speech', desc: 'Spoken dialogue' },
+                  { mode: 'song' as ProcessingMode, label: '🎵 Song', desc: 'Sung lyrics (less reliable)' },
+                  { mode: 'sound_classification' as ProcessingMode, label: '🔊 Sounds', desc: 'Environmental sounds' },
+                ]).map(({ mode, label, desc }) => (
                   <button
                     key={mode}
                     onClick={() => setSettings(s => ({ ...s, processingMode: mode }))}
-                    className={`flex-1 px-3 py-2 text-xs font-medium rounded-lg transition-all
+                    className={`flex-1 px-3 py-3 rounded-lg text-left transition-all
                       ${settings.processingMode === mode
-                        ? 'bg-blue-600 text-white shadow-lg shadow-blue-600/20'
-                        : 'bg-slate-800 text-slate-400 hover:bg-slate-700 hover:text-slate-200'
+                        ? 'bg-blue-600/20 border border-blue-500/50 text-blue-200'
+                        : 'bg-slate-800 border border-slate-700 text-slate-400 hover:bg-slate-700'
                       }`}
                   >
-                    {mode === 'speech' ? '🎙 Speech' : mode === 'song' ? '🎵 Song' : '🔊 Sounds'}
+                    <div className="text-sm font-medium">{label}</div>
+                    <div className="text-xs opacity-70 mt-0.5">{desc}</div>
                   </button>
                 ))}
               </div>
               {settings.processingMode === 'song' && (
-                <p className="text-xs text-amber-400/80 mt-2">
-                  ⚠ Song transcription is less reliable than speech. Results may be incomplete or inaccurate.
+                <p className="text-xs text-amber-400/80 mt-3">
+                  ⚠ Song/singing recognition is significantly less reliable than speech. Results may be incomplete.
                 </p>
               )}
             </div>
 
-            {/* Audio Source */}
+            {/* Language */}
             <div className="bg-slate-900 border border-slate-800 rounded-xl p-4">
-              <h2 className="text-sm font-medium text-slate-300 mb-3">Audio Source</h2>
-              
-              {/* File Upload */}
-              <div
-                onDragOver={handleDragOver}
-                onDragLeave={handleDragLeave}
-                onDrop={handleDrop}
-                className={`border-2 border-dashed rounded-lg p-4 text-center transition-all cursor-pointer
-                  ${dragOver ? 'border-blue-500 bg-blue-500/10' : 'border-slate-700 hover:border-slate-500'}`}
-                onClick={() => fileInputRef.current?.click()}
-                role="button"
-                tabIndex={0}
-                aria-label="Upload audio file"
-                onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') fileInputRef.current?.click(); }}
+              <label className="block text-sm font-medium text-slate-300 mb-2">Source Language</label>
+              <select
+                value={settings.sourceLanguage}
+                onChange={(e) => setSettings(s => ({ ...s, sourceLanguage: e.target.value }))}
+                className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:ring-1 focus:ring-blue-500"
               >
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  accept="audio/*,video/*"
-                  className="hidden"
-                  onChange={(e) => handleFileSelect(e.target.files)}
-                />
-                <svg className="w-8 h-8 mx-auto text-slate-500 mb-2" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5" />
-                </svg>
-                <p className="text-sm text-slate-400">Drop audio/video file or click to browse</p>
-                <p className="text-xs text-slate-600 mt-1">WAV, MP3, OGG, FLAC, M4A, WebM, MP4</p>
-              </div>
+                <option value="auto">Auto-detect</option>
+                {Object.entries(SUPPORTED_LANGUAGES).map(([code, name]) => (
+                  <option key={code} value={code}>{name}</option>
+                ))}
+              </select>
+            </div>
 
-              {/* Recording & Capture Buttons */}
-              <div className="flex gap-2 mt-3">
+            {/* Live Controls */}
+            <div className="bg-slate-900 border border-slate-800 rounded-xl p-4">
+              <label className="block text-sm font-medium text-slate-300 mb-3">Start Live Session</label>
+              
+              <div className="grid grid-cols-2 gap-3">
                 <button
-                  onClick={isRecording ? stopRecording : startRecording}
-                  className={`flex-1 flex items-center justify-center gap-2 px-3 py-2.5 rounded-lg text-sm font-medium transition-all
-                    ${isRecording
-                      ? 'bg-red-600 text-white animate-pulse'
-                      : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
+                  onClick={() => startLiveSession('microphone')}
+                  disabled={isLiveActive}
+                  className={`flex items-center justify-center gap-2 px-4 py-3 rounded-lg text-sm font-medium transition-all
+                    ${isLiveActive
+                      ? 'bg-slate-800 text-slate-600 cursor-not-allowed'
+                      : 'bg-emerald-600 text-white hover:bg-emerald-500 shadow-lg shadow-emerald-600/20'
                     }`}
-                  disabled={isCapturing}
                 >
-                  <span className={`w-2.5 h-2.5 rounded-full ${isRecording ? 'bg-white' : 'bg-red-500'}`} />
-                  {isRecording ? `Stop (${formatDuration(recordingDuration)})` : 'Record'}
+                  <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
+                  </svg>
+                  Microphone
                 </button>
                 
                 <button
-                  onClick={isCapturing ? stopCapture : startCapture}
-                  className={`flex-1 flex items-center justify-center gap-2 px-3 py-2.5 rounded-lg text-sm font-medium transition-all
-                    ${isCapturing
-                      ? 'bg-violet-600 text-white'
-                      : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
+                  onClick={() => startLiveSession('display_capture')}
+                  disabled={isLiveActive}
+                  className={`flex items-center justify-center gap-2 px-4 py-3 rounded-lg text-sm font-medium transition-all
+                    ${isLiveActive
+                      ? 'bg-slate-800 text-slate-600 cursor-not-allowed'
+                      : 'bg-violet-600 text-white hover:bg-violet-500 shadow-lg shadow-violet-600/20'
                     }`}
-                  disabled={isRecording}
-                  title="Capture browser tab audio"
                 >
-                  <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                  <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
                     <path strokeLinecap="round" strokeLinejoin="round" d="M9 17.25v1.007a3 3 0 01-.879 2.122L7.5 21h9l-.621-.621A3 3 0 0115 18.257V17.25m6-12V15a2.25 2.25 0 01-2.25 2.25H5.25A2.25 2.25 0 013 15V5.25m18 0A2.25 2.25 0 0018.75 3H5.25A2.25 2.25 0 003 5.25m18 0V12a2.25 2.25 0 01-2.25 2.25H5.25A2.25 2.25 0 013 12V5.25" />
                   </svg>
-                  {isCapturing ? 'Stop Capture' : 'Tab Audio'}
+                  Tab Audio
                 </button>
               </div>
-            </div>
 
-            {/* Audio Player */}
-            {audioSource && (
-              <div className="bg-slate-900 border border-slate-800 rounded-xl p-4">
-                <div className="flex items-center justify-between mb-3">
-                  <div>
-                    <h3 className="text-sm font-medium text-slate-200 truncate max-w-[200px]">{audioSource.name}</h3>
-                    <p className="text-xs text-slate-500">
-                      {audioSource.type === 'file' && audioSource.file
-                        ? `${(audioSource.file.size / (1024 * 1024)).toFixed(1)} MB`
-                        : audioSource.type}
-                    </p>
+              {isLiveActive && (
+                <div className="mt-4 space-y-3">
+                  <div className="flex items-center gap-2">
+                    <span className="relative flex h-3 w-3">
+                      {liveState === 'capturing' && (
+                        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                      )}
+                      <span className={`relative inline-flex rounded-full h-3 w-3 ${
+                        liveState === 'capturing' ? 'bg-emerald-500' :
+                        liveState === 'paused' ? 'bg-amber-500' :
+                        'bg-slate-500'
+                      }`}></span>
+                    </span>
+                    <span className="text-sm text-slate-300">
+                      {liveState === 'capturing' ? 'Capturing audio...' :
+                       liveState === 'paused' ? 'Paused' :
+                       liveState === 'processing_stopped' ? 'Finalizing...' :
+                       liveState === 'requesting_permission' ? 'Requesting permission...' :
+                       'Active'}
+                    </span>
+                    {activeSession?.processingBacklog && activeSession.processingBacklog > 0 && (
+                      <span className="text-xs text-amber-400 ml-auto">
+                        ⚠ {activeSession.processingBacklog} chunk(s) queued
+                        {activeSession.droppedChunks ? ` • ${activeSession.droppedChunks} dropped` : ''}
+                      </span>
+                    )}
                   </div>
-                  <button
-                    onClick={clearSession}
-                    className="p-1.5 rounded-lg hover:bg-slate-800 text-slate-500 hover:text-slate-300 transition-colors"
-                    title="Remove audio"
-                    aria-label="Remove audio"
-                  >
-                    <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                      <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
-                    </svg>
-                  </button>
-                </div>
-                
-                {audioSource.objectUrl && (
-                  <audio
-                    ref={audioRef}
-                    src={audioSource.objectUrl}
-                    controls
-                    className="w-full h-10 rounded-lg"
-                    style={{ filter: 'invert(0.85) hue-rotate(180deg)' }}
-                  />
-                )}
-              </div>
-            )}
-
-            {/* Process Button */}
-            <div className="flex gap-2">
-              <button
-                onClick={startProcessing}
-                disabled={!audioSource?.file || !!isProcessing}
-                className={`flex-1 py-3 rounded-xl text-sm font-semibold transition-all
-                  ${!audioSource?.file || isProcessing
-                    ? 'bg-slate-800 text-slate-600 cursor-not-allowed'
-                    : 'bg-blue-600 text-white hover:bg-blue-500 shadow-lg shadow-blue-600/20'
-                  }`}
-              >
-                {isProcessing ? 'Processing...' : 
-                  settings.processingMode === 'sound_classification' ? 'Classify Sounds' :
-                  settings.processingMode === 'song' ? 'Transcribe Song' :
-                  'Transcribe'}
-              </button>
-              
-              {isProcessing && (
-                <button
-                  onClick={cancelProcessing}
-                  className="px-4 py-3 rounded-xl text-sm font-medium bg-slate-800 text-slate-300 hover:bg-red-900/50 hover:text-red-300 transition-all"
-                >
-                  Cancel
-                </button>
-              )}
-            </div>
-
-            {/* Progress */}
-            {job && (
-              <div className="bg-slate-900 border border-slate-800 rounded-xl p-4">
-                <div className="flex items-center justify-between mb-2">
-                  <span className={`text-xs font-medium ${getStatusColor(job.status)}`}>
-                    {job.progressMessage}
-                  </span>
-                  <span className="text-xs text-slate-500">{Math.round(job.progress)}%</span>
-                </div>
-                <div className="w-full h-1.5 bg-slate-800 rounded-full overflow-hidden">
-                  <div
-                    className={`h-full rounded-full transition-all duration-300 ${
-                      job.status === 'failed' ? 'bg-red-500' :
-                      job.status === 'completed' ? 'bg-emerald-500' :
-                      job.status === 'cancelled' ? 'bg-amber-500' :
-                      'bg-blue-500'
-                    }`}
-                    style={{ width: `${job.progress}%` }}
-                  />
-                </div>
-                {job.error && (
-                  <p className="text-xs text-red-400 mt-2">{job.error}</p>
-                )}
-              </div>
-            )}
-          </div>
-
-          {/* Right Panel - Results */}
-          <div className="lg:col-span-7 space-y-4">
-            
-            {/* Results Header */}
-            <div className="flex items-center justify-between">
-              <h2 className="text-sm font-medium text-slate-300">
-                {settings.processingMode === 'sound_classification' ? 'Sound Events' : 'Transcript'}
-                {segments.length > 0 && (
-                  <span className="text-slate-500 ml-2">({segments.length} segments)</span>
-                )}
-              </h2>
-              
-              {segments.length > 0 && (
-                <div className="flex gap-1">
-                  {(['txt', 'srt', 'vtt', 'json'] as const).map(fmt => (
+                  
+                  <div className="flex gap-2">
+                    {liveState === 'capturing' ? (
+                      <button
+                        onClick={pauseLiveSession}
+                        className="flex-1 py-2 rounded-lg text-sm font-medium bg-amber-600/20 text-amber-300 border border-amber-600/30 hover:bg-amber-600/30 transition-colors"
+                      >
+                        ⏸ Pause
+                      </button>
+                    ) : liveState === 'paused' ? (
+                      <button
+                        onClick={resumeLiveSession}
+                        className="flex-1 py-2 rounded-lg text-sm font-medium bg-emerald-600/20 text-emerald-300 border border-emerald-600/30 hover:bg-emerald-600/30 transition-colors"
+                      >
+                        ▶ Resume
+                      </button>
+                    ) : null}
+                    
                     <button
-                      key={fmt}
-                      onClick={() => handleExport(fmt)}
-                      className="px-2.5 py-1 text-xs font-medium rounded-md bg-slate-800 text-slate-400 hover:bg-slate-700 hover:text-slate-200 transition-colors"
-                      title={`Export as ${fmt.toUpperCase()}`}
+                      onClick={stopLiveSession}
+                      className="flex-1 py-2 rounded-lg text-sm font-medium bg-slate-700 text-slate-200 hover:bg-slate-600 transition-colors"
                     >
-                      {fmt.toUpperCase()}
+                      ⏹ Stop & Finalize
                     </button>
-                  ))}
+                    
+                    <button
+                      onClick={cancelLiveSession}
+                      className="flex-1 py-2 rounded-lg text-sm font-medium bg-red-900/30 text-red-300 border border-red-800/50 hover:bg-red-900/50 transition-colors"
+                    >
+                      ✕ Cancel
+                    </button>
+                  </div>
                 </div>
+              )}
+
+              {!isLiveActive && (
+                <p className="text-xs text-slate-500 mt-3">
+                  Tab audio capture requires selecting "Share tab audio" or "Share system audio" in the browser dialog.
+                  Browser support varies — Chrome and Edge work best.
+                </p>
               )}
             </div>
 
-            {/* Transcript Segments */}
-            {segments.length > 0 ? (
-              <div className="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden">
-                <div className="max-h-[60vh] overflow-y-auto">
-                  {segments.map((segment, index) => (
-                    <div
-                      key={segment.id}
-                      className={`group border-b border-slate-800/50 last:border-0 hover:bg-slate-800/30 transition-colors`}
+            {/* Model info */}
+            <div className="bg-slate-900/50 border border-slate-800/50 rounded-xl p-4">
+              <div className="flex items-center gap-2 text-xs text-slate-500">
+                <span className="w-2 h-2 rounded-full bg-emerald-500"></span>
+                <span>Model: {WHISPER_MODELS[settings.modelId as keyof typeof WHISPER_MODELS]?.name}</span>
+                <span>•</span>
+                <span>{settings.enableWebGPU ? 'WebGPU' : 'WASM'}</span>
+                <span>•</span>
+                <span>All processing local</span>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ─── Files Tab ────────────────────────────────────────────────────── */}
+        {activeTab === 'files' && (
+          <div className="space-y-6 max-w-3xl mx-auto">
+            <div className="text-center mb-4">
+              <h2 className="text-xl font-semibold text-slate-100 mb-2">File Transcription</h2>
+              <p className="text-sm text-slate-400">
+                Upload audio or video files for batch transcription. Multiple files supported.
+              </p>
+            </div>
+
+            {/* Drop zone */}
+            <div
+              onDragOver={handleDragOver}
+              onDragLeave={handleDragLeave}
+              onDrop={handleDrop}
+              className={`border-2 border-dashed rounded-xl p-8 text-center transition-all cursor-pointer
+                ${dragOver ? 'border-blue-500 bg-blue-500/10' : 'border-slate-700 hover:border-slate-500 bg-slate-900'}`}
+              onClick={() => fileInputRef.current?.click()}
+              role="button"
+              tabIndex={0}
+              aria-label="Upload audio or video files"
+              onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') fileInputRef.current?.click(); }}
+            >
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="audio/*,video/*"
+                multiple
+                className="hidden"
+                onChange={(e) => handleFileSelect(e.target.files)}
+              />
+              <svg className="w-12 h-12 mx-auto text-slate-500 mb-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5" />
+              </svg>
+              <p className="text-sm text-slate-300 font-medium">Drop files here or click to browse</p>
+              <p className="text-xs text-slate-500 mt-1">WAV, MP3, OGG, FLAC, M4A, WebM, MP4 • Multiple files supported</p>
+            </div>
+
+            {/* Mode selector for files */}
+            <div className="flex gap-2">
+              {(['speech', 'song', 'sound_classification'] as ProcessingMode[]).map(mode => (
+                <button
+                  key={mode}
+                  onClick={() => setSettings(s => ({ ...s, processingMode: mode }))}
+                  className={`flex-1 px-3 py-2 text-xs font-medium rounded-lg transition-all
+                    ${settings.processingMode === mode
+                      ? 'bg-blue-600 text-white'
+                      : 'bg-slate-800 text-slate-400 hover:bg-slate-700'
+                    }`}
+                >
+                  {mode === 'speech' ? '🎙 Speech' : mode === 'song' ? '🎵 Song' : '🔊 Sounds'}
+                </button>
+              ))}
+            </div>
+
+            {/* File queue */}
+            <FileQueueView queue={fileQueue} />
+          </div>
+        )}
+
+        {/* ─── Results Tab ──────────────────────────────────────────────────── */}
+        {activeTab === 'results' && (
+          <div className="space-y-4">
+            {/* Session selector */}
+            {sessions.length > 1 && (
+              <div className="flex gap-2 overflow-x-auto pb-2">
+                {sessions.map(session => (
+                  <button
+                    key={session.id}
+                    onClick={() => setSelectedSessionId(session.id)}
+                    className={`flex items-center gap-2 px-3 py-2 rounded-lg text-sm whitespace-nowrap transition-colors
+                      ${(selectedSessionId || sessions[0]?.id) === session.id
+                        ? 'bg-slate-800 text-slate-100 border border-slate-600'
+                        : 'bg-slate-900 text-slate-400 border border-slate-800 hover:bg-slate-800'
+                      }`}
+                  >
+                    {getStatusBadge(session)}
+                    <span className="truncate max-w-[150px]">{session.sourceLabel}</span>
+                    <button
+                      onClick={(e) => { e.stopPropagation(); removeSession(session.id); }}
+                      className="ml-1 p-0.5 rounded hover:bg-slate-700 text-slate-500 hover:text-slate-300"
+                      aria-label={`Remove ${session.sourceLabel}`}
                     >
-                      <div className="flex items-start gap-3 p-3">
-                        {/* Timestamp */}
-                        {settings.enableTimestamps && segment.endTime > 0 && (
+                      <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+                      </svg>
+                    </button>
+                  </button>
+                ))}
+              </div>
+            )}
+
+            {/* Active session display */}
+            {activeSession ? (
+              <div className="space-y-4">
+                {/* Session header */}
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-3">
+                    <h2 className="text-sm font-medium text-slate-200 truncate max-w-[200px]">
+                      {activeSession.sourceLabel}
+                    </h2>
+                    {getStatusBadge(activeSession)}
+                    {activeSession.language !== 'unknown' && (
+                      <span className="text-xs text-slate-500">
+                        {SUPPORTED_LANGUAGES[activeSession.language] || activeSession.language}
+                      </span>
+                    )}
+                  </div>
+                  
+                  <div className="flex items-center gap-2">
+                    {activeSession.segments.length > 0 && (
+                      <>
+                        {activeSession.translatedSegments.length > 0 && (
                           <button
-                            className="text-xs text-blue-400/70 font-mono whitespace-nowrap pt-0.5 hover:text-blue-300 transition-colors min-w-[70px]"
-                            onClick={() => {
-                              if (audioRef.current && segment.startTime !== undefined) {
-                                audioRef.current.currentTime = segment.startTime;
-                                audioRef.current.play();
-                              }
-                            }}
-                            title="Jump to this time"
+                            onClick={() => setShowTranslation(!showTranslation)}
+                            className={`px-2.5 py-1 text-xs font-medium rounded-md transition-colors
+                              ${showTranslation ? 'bg-blue-600 text-white' : 'bg-slate-800 text-slate-400 hover:bg-slate-700'}`}
                           >
-                            {formatDuration(segment.startTime)}
+                            Translation
                           </button>
                         )}
-                        
-                        {/* Text */}
-                        {editingSegmentId === segment.id ? (
-                          <textarea
-                            autoFocus
-                            value={segment.text}
-                            onChange={(e) => updateSegmentText(segment.id, e.target.value)}
-                            onBlur={() => setEditingSegmentId(null)}
-                            onKeyDown={(e) => { if (e.key === 'Escape') setEditingSegmentId(null); }}
-                            className="flex-1 bg-slate-800 border border-blue-500/50 rounded-lg px-3 py-1.5 text-sm text-slate-100 resize-none focus:outline-none focus:ring-1 focus:ring-blue-500"
-                            rows={2}
-                          />
-                        ) : (
-                          <p
-                            className={`flex-1 text-sm leading-relaxed cursor-pointer ${
-                              segment.isUncertain ? 'text-amber-200/80 italic' : 'text-slate-200'
-                            }`}
-                            onClick={() => setEditingSegmentId(segment.id)}
-                            title="Click to edit"
-                          >
-                            {segment.text || <span className="text-slate-600 italic">[empty segment]</span>}
-                          </p>
-                        )}
-                        
-                        {/* Segment number */}
-                        <span className="text-xs text-slate-700 font-mono">
-                          {index + 1}
-                        </span>
-                      </div>
-                    </div>
-                  ))}
+                        <div className="flex gap-1">
+                          {(['txt', 'srt', 'vtt', 'json'] as const).map(fmt => (
+                            <button
+                              key={fmt}
+                              onClick={() => handleExport(fmt)}
+                              className="px-2 py-1 text-xs font-medium rounded-md bg-slate-800 text-slate-400 hover:bg-slate-700 hover:text-slate-200 transition-colors"
+                              title={`Export as ${fmt.toUpperCase()}`}
+                            >
+                              {fmt.toUpperCase()}
+                            </button>
+                          ))}
+                        </div>
+                      </>
+                    )}
+                    <button
+                      onClick={() => removeSession(activeSession.id)}
+                      className="p-1.5 rounded-lg hover:bg-slate-800 text-slate-500 hover:text-red-400 transition-colors"
+                      title="Remove session"
+                      aria-label="Remove session"
+                    >
+                      <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                      </svg>
+                    </button>
+                  </div>
                 </div>
-              </div>
-            ) : soundEvents.length > 0 ? (
-              /* Sound Classification Results */
-              <div className="bg-slate-900 border border-slate-800 rounded-xl p-4">
-                <div className="space-y-2">
-                  {soundEvents.map((event, i) => (
-                    <div key={i} className="flex items-center gap-3">
-                      <span className="text-sm text-slate-200 flex-1 truncate">{event.label}</span>
-                      <div className="w-32 h-2 bg-slate-800 rounded-full overflow-hidden">
+
+                {/* Backlog warning */}
+                {activeSession.processingBacklog && activeSession.processingBacklog > 2 && (
+                  <div className="bg-amber-900/20 border border-amber-700/30 rounded-lg px-3 py-2 text-xs text-amber-300">
+                    ⚠ Processing is behind — {activeSession.processingBacklog} audio chunks queued.
+                    {activeSession.droppedChunks ? ` ${activeSession.droppedChunks} chunk(s) were dropped due to overload.` : ''}
+                    {' '}Transcript may have gaps.
+                  </div>
+                )}
+
+                {/* Transcript segments */}
+                {activeSession.segments.length > 0 ? (
+                  <div className="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden">
+                    <div className="max-h-[60vh] overflow-y-auto">
+                      {activeSession.segments.map((segment, index) => (
                         <div
-                          className="h-full bg-gradient-to-r from-violet-500 to-blue-500 rounded-full"
-                          style={{ width: `${(event.score * 100).toFixed(0)}%` }}
-                        />
-                      </div>
-                      <span className="text-xs text-slate-400 font-mono w-12 text-right">
-                        {(event.score * 100).toFixed(1)}%
-                      </span>
+                          key={segment.id}
+                          className="border-b border-slate-800/50 last:border-0 hover:bg-slate-800/20 transition-colors"
+                        >
+                          <div className="flex items-start gap-3 p-3">
+                            {/* Timestamp */}
+                            {settings.enableTimestamps && segment.endTime > 0 && (
+                              <span className="text-xs text-blue-400/70 font-mono whitespace-nowrap pt-0.5 min-w-[60px]">
+                                {formatDuration(segment.startTime)}
+                              </span>
+                            )}
+                            
+                            {/* Text */}
+                            {editingSegmentId === segment.id ? (
+                              <textarea
+                                autoFocus
+                                value={segment.text}
+                                onChange={(e) => updateSegmentText(activeSession.id, segment.id, e.target.value)}
+                                onBlur={() => setEditingSegmentId(null)}
+                                onKeyDown={(e) => { if (e.key === 'Escape') setEditingSegmentId(null); }}
+                                className="flex-1 bg-slate-800 border border-blue-500/50 rounded-lg px-3 py-1.5 text-sm text-slate-100 resize-none focus:outline-none focus:ring-1 focus:ring-blue-500"
+                                rows={2}
+                              />
+                            ) : (
+                              <p
+                                className={`flex-1 text-sm leading-relaxed cursor-pointer ${
+                                  segment.isUncertain ? 'text-amber-200/80 italic' : 'text-slate-200'
+                                }`}
+                                onClick={() => setEditingSegmentId(segment.id)}
+                                title="Click to edit"
+                              >
+                                {segment.text || <span className="text-slate-600 italic">[empty]</span>}
+                              </p>
+                            )}
+
+                            {/* Translation */}
+                            {showTranslation && (
+                              <div className="flex-1 text-sm text-blue-300/70 italic border-l border-slate-700 pl-3">
+                                {activeSession.translatedSegments.find(t => t.originalId === segment.id)?.text || '—'}
+                              </div>
+                            )}
+                            
+                            <span className="text-xs text-slate-700 font-mono">{index + 1}</span>
+                          </div>
+                        </div>
+                      ))}
                     </div>
-                  ))}
-                </div>
-                <p className="text-xs text-slate-600 mt-4">
-                  Scores represent model confidence, not calibrated probabilities.
-                </p>
+                  </div>
+                ) : activeSession.soundEvents.length > 0 ? (
+                  /* Sound classification results */
+                  <div className="bg-slate-900 border border-slate-800 rounded-xl p-4">
+                    <div className="space-y-2">
+                      {activeSession.soundEvents.map((event, i) => (
+                        <div key={i} className="flex items-center gap-3">
+                          <span className="text-sm text-slate-200 flex-1 truncate">{event.label}</span>
+                          <div className="w-32 h-2 bg-slate-800 rounded-full overflow-hidden">
+                            <div
+                              className="h-full bg-gradient-to-r from-violet-500 to-blue-500 rounded-full"
+                              style={{ width: `${(event.score * 100).toFixed(0)}%` }}
+                            />
+                          </div>
+                          <span className="text-xs text-slate-400 font-mono w-12 text-right">
+                            {(event.score * 100).toFixed(1)}%
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                    <p className="text-xs text-slate-600 mt-4">
+                      Scores represent model confidence, not calibrated probabilities.
+                    </p>
+                  </div>
+                ) : (
+                  /* Empty / processing state */
+                  <div className="bg-slate-900/50 border border-slate-800/50 rounded-xl p-8 text-center">
+                    {activeSession.status === 'processing' || activeSession.status === 'decoding' || activeSession.status === 'downloading_model' || activeSession.status === 'waiting_for_model' ? (
+                      <div>
+                        <div className="w-8 h-8 mx-auto mb-3 border-2 border-blue-500 border-t-transparent rounded-full animate-spin"></div>
+                        <p className="text-sm text-slate-300">Processing...</p>
+                        <p className="text-xs text-slate-500 mt-1">
+                          {activeSession.isLive ? 'Audio is being captured and processed in chunks' : 'Decoding and transcribing audio'}
+                        </p>
+                      </div>
+                    ) : activeSession.status === 'failed' ? (
+                      <div>
+                        <p className="text-sm text-red-400">Processing failed</p>
+                        <p className="text-xs text-slate-500 mt-1">Check settings and try again</p>
+                      </div>
+                    ) : (
+                      <div>
+                        <p className="text-sm text-slate-400">No transcript data yet</p>
+                        <p className="text-xs text-slate-600 mt-1">
+                          {activeSession.isLive
+                            ? 'Start a live session from the Live tab'
+                            : 'Add files from the Files tab'}
+                        </p>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* Partial segment (live) */}
+                {activeSession.partialSegment && activeSession.partialSegment.text && (
+                  <div className="bg-slate-900/50 border border-blue-800/30 rounded-xl p-3">
+                    <div className="flex items-start gap-3">
+                      <span className="text-xs text-blue-400/50 font-mono pt-0.5">...</span>
+                      <p className="flex-1 text-sm text-blue-300/70 italic">
+                        {activeSession.partialSegment.text}
+                      </p>
+                    </div>
+                  </div>
+                )}
               </div>
             ) : (
-              /* Empty State */
+              /* No sessions */
               <div className="bg-slate-900/50 border border-slate-800/50 rounded-xl p-12 text-center">
                 <div className="w-16 h-16 mx-auto mb-4 rounded-2xl bg-slate-800/50 flex items-center justify-center">
                   <svg className="w-8 h-8 text-slate-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1}>
-                    <path strokeLinecap="round" strokeLinejoin="round" d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
                   </svg>
                 </div>
-                <h3 className="text-sm font-medium text-slate-400 mb-1">No transcript yet</h3>
-                <p className="text-xs text-slate-600 max-w-sm mx-auto">
-                  {settings.processingMode === 'sound_classification'
-                    ? 'Load an audio file and click "Classify Sounds" to identify environmental sounds.'
-                    : 'Load an audio file or record audio, then click "Transcribe" to begin.'
-                  }
+                <h3 className="text-sm font-medium text-slate-400 mb-1">No transcripts yet</h3>
+                <p className="text-xs text-slate-600">
+                  Start a live session or upload files to begin transcription.
                 </p>
-                <div className="mt-4 text-xs text-slate-700">
-                  <p>Model: {WHISPER_MODELS[settings.modelId as keyof typeof WHISPER_MODELS]?.name || settings.modelId}</p>
-                  <p className="mt-1">All processing runs locally in your browser. No data is sent to external servers.</p>
-                </div>
+              </div>
+            )}
+
+            {sessions.length > 0 && (
+              <div className="flex justify-end">
+                <button
+                  onClick={clearAllSessions}
+                  className="px-3 py-1.5 text-xs font-medium rounded-lg bg-slate-800 text-slate-400 hover:bg-red-900/30 hover:text-red-300 transition-colors"
+                >
+                  Clear all sessions
+                </button>
               </div>
             )}
           </div>
-        </div>
+        )}
       </main>
 
       {/* Settings Panel */}
       {showSettings && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={() => setShowSettings(false)}>
-          <div
-            className="bg-slate-900 border border-slate-700 rounded-2xl w-full max-w-lg max-h-[80vh] overflow-y-auto shadow-2xl"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="p-6 space-y-6">
-              <div className="flex items-center justify-between">
-                <h2 className="text-lg font-semibold text-slate-100">Settings</h2>
-                <button
-                  onClick={() => setShowSettings(false)}
-                  className="p-2 rounded-lg hover:bg-slate-800 text-slate-400"
-                  aria-label="Close settings"
-                >
-                  <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                    <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
-                  </svg>
-                </button>
-              </div>
-
-              {/* Model Selection */}
-              <div>
-                <label className="block text-sm font-medium text-slate-300 mb-2">Speech Recognition Model</label>
-                <select
-                  value={settings.modelId}
-                  onChange={(e) => setSettings(s => ({ ...s, modelId: e.target.value }))}
-                  className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:ring-1 focus:ring-blue-500"
-                >
-                  {Object.entries(WHISPER_MODELS).map(([id, info]) => (
-                    <option key={id} value={id}>{info.name} ({info.size})</option>
-                  ))}
-                </select>
-                <p className="text-xs text-slate-500 mt-1">
-                  Smaller models download faster and use less memory but may be less accurate.
-                </p>
-              </div>
-
-              {/* Source Language */}
-              <div>
-                <label className="block text-sm font-medium text-slate-300 mb-2">Source Language</label>
-                <select
-                  value={settings.sourceLanguage}
-                  onChange={(e) => setSettings(s => ({ ...s, sourceLanguage: e.target.value }))}
-                  className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:ring-1 focus:ring-blue-500"
-                >
-                  <option value="auto">Auto-detect</option>
-                  {Object.entries(SUPPORTED_LANGUAGES).map(([code, name]) => (
-                    <option key={code} value={code}>{name}</option>
-                  ))}
-                </select>
-              </div>
-
-              {/* Translation */}
-              <div>
-                <label className="block text-sm font-medium text-slate-300 mb-2">Translation</label>
-                <div className="flex items-center gap-3 mb-2">
-                  <label className="flex items-center gap-2 text-sm text-slate-400 cursor-pointer">
-                    <input
-                      type="checkbox"
-                      checked={settings.enableTranslation}
-                      onChange={(e) => setSettings(s => ({ ...s, enableTranslation: e.target.checked }))}
-                      className="rounded border-slate-600 bg-slate-800 text-blue-500 focus:ring-blue-500"
-                    />
-                    Translate to English (Whisper built-in)
-                  </label>
-                </div>
-                <p className="text-xs text-slate-500">
-                  Whisper can translate speech directly to English. For other target languages, a separate translation model is needed (not yet implemented).
-                </p>
-              </div>
-
-              {/* Processing Options */}
-              <div>
-                <label className="block text-sm font-medium text-slate-300 mb-2">Processing Options</label>
-                <div className="space-y-2">
-                  <label className="flex items-center gap-2 text-sm text-slate-400 cursor-pointer">
-                    <input
-                      type="checkbox"
-                      checked={settings.enableTimestamps}
-                      onChange={(e) => setSettings(s => ({ ...s, enableTimestamps: e.target.checked }))}
-                      className="rounded border-slate-600 bg-slate-800 text-blue-500 focus:ring-blue-500"
-                    />
-                    Include timestamps
-                  </label>
-                  <label className="flex items-center gap-2 text-sm text-slate-400 cursor-pointer">
-                    <input
-                      type="checkbox"
-                      checked={settings.enableWebGPU}
-                      onChange={(e) => setSettings(s => ({ ...s, enableWebGPU: e.target.checked }))}
-                      className="rounded border-slate-600 bg-slate-800 text-blue-500 focus:ring-blue-500"
-                    />
-                    Use WebGPU (requires compatible browser/GPU)
-                  </label>
-                </div>
-              </div>
-
-              {/* Chunk Duration */}
-              <div>
-                <label className="block text-sm font-medium text-slate-300 mb-2">
-                  Chunk Duration: {settings.chunkDuration}s
-                </label>
-                <input
-                  type="range"
-                  min="10"
-                  max="60"
-                  step="5"
-                  value={settings.chunkDuration}
-                  onChange={(e) => setSettings(s => ({ ...s, chunkDuration: parseInt(e.target.value) }))}
-                  className="w-full accent-blue-500"
-                />
-                <p className="text-xs text-slate-500 mt-1">
-                  Longer chunks may improve accuracy but use more memory.
-                </p>
-              </div>
-
-              {/* Privacy */}
-              <div className="border-t border-slate-800 pt-4">
-                <h3 className="text-sm font-medium text-slate-300 mb-2">Privacy & Security</h3>
-                <div className="space-y-1 text-xs text-slate-500">
-                  <p>• All audio processing runs locally in your browser</p>
-                  <p>• No audio or transcripts are sent to external servers</p>
-                  <p>• Models are downloaded once from Hugging Face and cached</p>
-                  <p>• No user accounts, telemetry, or analytics</p>
-                  <p>• API keys (if configured) are stored in memory only</p>
-                </div>
-              </div>
-
-              {/* Clear Session */}
-              <div className="border-t border-slate-800 pt-4">
-                <button
-                  onClick={() => { clearSession(); setShowSettings(false); }}
-                  className="w-full py-2 rounded-lg bg-slate-800 text-slate-300 text-sm font-medium hover:bg-red-900/30 hover:text-red-300 transition-colors"
-                >
-                  Clear Session & Release Resources
-                </button>
-              </div>
-            </div>
-          </div>
-        </div>
+        <SettingsPanel
+          settings={settings}
+          onChange={setSettings}
+          onClose={() => setShowSettings(false)}
+        />
       )}
 
       {/* Footer */}
-      <footer className="border-t border-slate-800/50 py-3 px-4">
+      <footer className="border-t border-slate-800/50 py-3 px-4 mt-auto">
         <div className="max-w-7xl mx-auto flex items-center justify-between text-xs text-slate-600">
-          <span>AudioScribe — Local-first, privacy-conscious audio transcription</span>
-          <span>
-            {settings.enableWebGPU ? 'WebGPU' : 'WASM'} • {WHISPER_MODELS[settings.modelId as keyof typeof WHISPER_MODELS]?.name || 'Model'}
-          </span>
+          <span>AudioScribe — Local-first, privacy-conscious transcription</span>
+          <span>{settings.enableWebGPU ? 'WebGPU' : 'WASM'} • {WHISPER_MODELS[settings.modelId as keyof typeof WHISPER_MODELS]?.name}</span>
         </div>
       </footer>
+    </div>
+  );
+}
+
+// ─── File Queue View Component ────────────────────────────────────────────────
+
+function FileQueueView({ queue }: { queue: FileQueueManager | null }) {
+  const [items, setItems] = useState<FileQueueItem[]>([]);
+
+  useEffect(() => {
+    if (!queue) return;
+    const update = () => setItems(queue.getQueue());
+    update();
+    const unsub = queue.subscribe(update);
+    const interval = setInterval(update, 500);
+    return () => { unsub(); clearInterval(interval); };
+  }, [queue]);
+
+  if (items.length === 0) {
+    return (
+      <div className="text-center py-8">
+        <p className="text-sm text-slate-500">
+          Files will appear here after upload. Processing begins automatically.
+        </p>
+        <p className="text-xs text-slate-600 mt-2">
+          Results appear in the Results tab as they complete.
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden">
+      <div className="px-4 py-2 border-b border-slate-800 flex items-center justify-between">
+        <span className="text-sm font-medium text-slate-300">Queue ({items.length})</span>
+        <button
+          onClick={() => queue?.clearCompleted()}
+          className="text-xs text-slate-500 hover:text-slate-300 transition-colors"
+        >
+          Clear completed
+        </button>
+      </div>
+      <div className="max-h-[40vh] overflow-y-auto divide-y divide-slate-800/50">
+        {items.map(item => (
+          <div key={item.id} className="px-4 py-3 flex items-center gap-3">
+            <div className="flex-1 min-w-0">
+              <p className="text-sm text-slate-200 truncate">{item.name}</p>
+              <div className="flex items-center gap-2 mt-1">
+                <span className={`text-xs ${
+                  item.status === 'completed' ? 'text-emerald-400' :
+                  item.status === 'failed' ? 'text-red-400' :
+                  item.status === 'cancelled' ? 'text-slate-500' :
+                  'text-blue-400'
+                }`}>
+                  {item.status === 'idle' ? 'Queued' :
+                   item.status === 'decoding' ? 'Decoding...' :
+                   item.status === 'processing' ? 'Transcribing...' :
+                   item.status === 'completed' ? '✓ Complete' :
+                   item.status === 'failed' ? `✗ ${item.error?.slice(0, 40) || 'Failed'}` :
+                   item.status === 'cancelled' ? 'Cancelled' :
+                   item.progressMessage}
+                </span>
+                <span className="text-xs text-slate-600">{(item.size / (1024 * 1024)).toFixed(1)} MB</span>
+              </div>
+              {(item.status === 'processing' || item.status === 'decoding') && (
+                <div className="w-full h-1 bg-slate-800 rounded-full mt-1.5 overflow-hidden">
+                  <div
+                    className="h-full bg-blue-500 rounded-full transition-all"
+                    style={{ width: `${item.progress}%` }}
+                  />
+                </div>
+              )}
+            </div>
+            <div className="flex gap-1">
+              {(item.status === 'failed' || item.status === 'cancelled') && (
+                <button
+                  onClick={() => queue?.retryItem(item.id)}
+                  className="p-1 rounded hover:bg-slate-700 text-slate-500 hover:text-slate-300"
+                  title="Retry"
+                >
+                  <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                  </svg>
+                </button>
+              )}
+              {(item.status === 'processing' || item.status === 'decoding' || item.status === 'idle') && (
+                <button
+                  onClick={() => queue?.cancelItem(item.id)}
+                  className="p-1 rounded hover:bg-red-900/30 text-slate-500 hover:text-red-400"
+                  title="Cancel"
+                >
+                  <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+                  </svg>
+                </button>
+              )}
+              <button
+                onClick={() => queue?.removeItem(item.id)}
+                className="p-1 rounded hover:bg-slate-700 text-slate-500 hover:text-slate-300"
+                title="Remove"
+              >
+                <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                </svg>
+              </button>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ─── Settings Panel Component ─────────────────────────────────────────────────
+
+function SettingsPanel({
+  settings,
+  onChange,
+  onClose,
+}: {
+  settings: AppSettings;
+  onChange: (s: AppSettings | ((prev: AppSettings) => AppSettings)) => void;
+  onClose: () => void;
+}) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={onClose}>
+      <div
+        className="bg-slate-900 border border-slate-700 rounded-2xl w-full max-w-lg max-h-[85vh] overflow-y-auto shadow-2xl m-4"
+        onClick={(e) => e.stopPropagation()}
+        role="dialog"
+        aria-label="Settings"
+      >
+        <div className="p-6 space-y-6">
+          <div className="flex items-center justify-between">
+            <h2 className="text-lg font-semibold text-slate-100">Settings</h2>
+            <button onClick={onClose} className="p-2 rounded-lg hover:bg-slate-800 text-slate-400" aria-label="Close">
+              <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+              </svg>
+            </button>
+          </div>
+
+          {/* Model */}
+          <div>
+            <label className="block text-sm font-medium text-slate-300 mb-2">Speech Recognition Model</label>
+            <select
+              value={settings.modelId}
+              onChange={(e) => onChange((s: AppSettings) => ({ ...s, modelId: e.target.value }))}
+              className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:ring-1 focus:ring-blue-500"
+            >
+              {Object.entries(WHISPER_MODELS).map(([id, info]) => (
+                <option key={id} value={id}>{info.name} ({info.size})</option>
+              ))}
+            </select>
+            <p className="text-xs text-slate-500 mt-1">
+              Smaller = faster download, less memory. Larger = better accuracy.
+            </p>
+          </div>
+
+          {/* Live settings */}
+          <div>
+            <label className="block text-sm font-medium text-slate-300 mb-2">Live Transcription</label>
+            <div className="space-y-3">
+              <div>
+                <label className="text-xs text-slate-400">Chunk duration: {settings.liveChunkDuration}s</label>
+                <input
+                  type="range" min="3" max="15" step="1"
+                  value={settings.liveChunkDuration}
+                  onChange={(e) => onChange((s: AppSettings) => ({ ...s, liveChunkDuration: parseInt(e.target.value) }))}
+                  className="w-full mt-1"
+                />
+                <p className="text-xs text-slate-600">Shorter = more responsive but less accurate</p>
+              </div>
+              <div>
+                <label className="text-xs text-slate-400">Overlap: {settings.liveOverlapDuration}s</label>
+                <input
+                  type="range" min="0" max="5" step="0.5"
+                  value={settings.liveOverlapDuration}
+                  onChange={(e) => onChange((s: AppSettings) => ({ ...s, liveOverlapDuration: parseFloat(e.target.value) }))}
+                  className="w-full mt-1"
+                />
+                <p className="text-xs text-slate-600">Overlap helps prevent missing words at chunk boundaries</p>
+              </div>
+              <div>
+                <label className="text-xs text-slate-400">Max buffered chunks: {settings.maxBufferedChunks}</label>
+                <input
+                  type="range" min="2" max="10" step="1"
+                  value={settings.maxBufferedChunks}
+                  onChange={(e) => onChange((s: AppSettings) => ({ ...s, maxBufferedChunks: parseInt(e.target.value) }))}
+                  className="w-full mt-1"
+                />
+                <p className="text-xs text-slate-600">Higher = tolerates slower inference, uses more memory</p>
+              </div>
+            </div>
+          </div>
+
+          {/* File settings */}
+          <div>
+            <label className="block text-sm font-medium text-slate-300 mb-2">File Processing</label>
+            <div className="space-y-2">
+              <div>
+                <label className="text-xs text-slate-400">Chunk duration: {settings.chunkDuration}s</label>
+                <input
+                  type="range" min="10" max="60" step="5"
+                  value={settings.chunkDuration}
+                  onChange={(e) => onChange((s: AppSettings) => ({ ...s, chunkDuration: parseInt(e.target.value) }))}
+                  className="w-full mt-1"
+                />
+              </div>
+              <div>
+                <label className="text-xs text-slate-400">Max concurrent files: {settings.maxConcurrentJobs}</label>
+                <input
+                  type="range" min="1" max="3" step="1"
+                  value={settings.maxConcurrentJobs}
+                  onChange={(e) => onChange((s: AppSettings) => ({ ...s, maxConcurrentJobs: parseInt(e.target.value) }))}
+                  className="w-full mt-1"
+                />
+              </div>
+            </div>
+          </div>
+
+          {/* Options */}
+          <div>
+            <label className="block text-sm font-medium text-slate-300 mb-2">Options</label>
+            <div className="space-y-2">
+              <label className="flex items-center gap-2 text-sm text-slate-400 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={settings.enableTimestamps}
+                  onChange={(e) => onChange((s: AppSettings) => ({ ...s, enableTimestamps: e.target.checked }))}
+                />
+                Include timestamps
+              </label>
+              <label className="flex items-center gap-2 text-sm text-slate-400 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={settings.enableTranslation}
+                  onChange={(e) => onChange((s: AppSettings) => ({ ...s, enableTranslation: e.target.checked }))}
+                />
+                Translate to English (Whisper built-in)
+              </label>
+              <label className="flex items-center gap-2 text-sm text-slate-400 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={settings.enableWebGPU}
+                  onChange={(e) => onChange((s: AppSettings) => ({ ...s, enableWebGPU: e.target.checked }))}
+                />
+                Use WebGPU (requires compatible hardware)
+              </label>
+            </div>
+          </div>
+
+          {/* Privacy */}
+          <div className="border-t border-slate-800 pt-4">
+            <h3 className="text-sm font-medium text-slate-300 mb-2">Privacy</h3>
+            <div className="space-y-1 text-xs text-slate-500">
+              <p>• All audio processing runs locally in your browser</p>
+              <p>• No audio or transcripts sent to external servers</p>
+              <p>• Models downloaded once from Hugging Face, then cached</p>
+              <p>• No accounts, telemetry, or analytics</p>
+              <p>• Microphone/capture streams released when session ends</p>
+            </div>
+          </div>
+        </div>
+      </div>
     </div>
   );
 }
